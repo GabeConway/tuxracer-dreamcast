@@ -111,10 +111,16 @@ static void probe(const char *what, const uint16_t *base) {
            (unsigned)(FB_W * FB_H), maxv);
 }
 
+/* The PVR's display registers. KOS does not expose FB_R_CTRL, and its low
+ * three bits are the only thing that says how wide a pixel in the scanout
+ * buffer actually is. */
+#define TR_FB_R_CTRL (*(volatile uint32_t *)0xA05F8044u)
+
 void tr_fbdump(void) {
     static uint16_t row[OUT_W];
     const uint16_t *fb;
-    uint32_t fb_off;
+    const uint32_t *fb32;
+    uint32_t fb_off, depth;
     int x, y;
 
     /*
@@ -137,13 +143,52 @@ void tr_fbdump(void) {
     probe("il_addr", (const uint16_t *)(0xa5000000 +
                                         (PVR_GET(PVR_FB_IL_ADDR) & 0x00fffffc)));
 
+    /*
+     * FB_R_CTRL[2:0] is the scanout pixel depth: 0=RGB555, 1=RGB565,
+     * 2=RGB888(24), 3=RGB0888(32).
+     *
+     * This is not a formality. A first full-resolution dump came back as
+     * magenta/green vertical stripes with the logo repeated across the screen,
+     * and the obvious reading was "the texture upload is broken". It was not:
+     * the buffer is 32 bits per pixel, and reading it as 16 sees each pixel as
+     * two half-pixels — which doubles the apparent width and turns every other
+     * column into the high half of the previous pixel. A half-resolution dump
+     * (STEP=2) accidentally sampled only one half of each pixel and therefore
+     * looked CORRECT, which is what made the wrong reading so convincing.
+     *
+     * So: never assume, always read the register.
+     */
+    /* FB_R_CTRL: bit0 enable, bit1 line_double, bits[3:2] depth. Reading the
+     * low three bits as the depth (an early mistake here) returns 5 for a
+     * perfectly ordinary enabled RGB565 mode and sends the decoder down the
+     * 32-bit path. */
+    depth = (TR_FB_R_CTRL >> 2) & 0x3u;
+    fb32  = (const uint32_t *)fb;
+
     printf("FBDUMP begin %dx%d rgb565\n", OUT_W, OUT_H);
-    printf("FBDUMP addr %08lx\n", (unsigned long)fb_off);
+    printf("FBDUMP addr %08lx depth=%lu ctrl=%08lx size=%08lx\n",
+           (unsigned long)fb_off, (unsigned long)depth,
+           (unsigned long)TR_FB_R_CTRL,
+           (unsigned long)(*(volatile uint32_t *)0xA05F805Cu));
 
     for(y = 0; y < OUT_H; y++) {
-        const uint16_t *src = &fb[(y * STEP) * FB_W];
-        for(x = 0; x < OUT_W; x++) {
-            row[x] = src[x * STEP];
+        if(depth >= 2) {
+            /* 24- or 32-bit scanout. Both are stored one pixel per 32-bit word
+             * here; squeeze back to RGB565 so the wire format stays one thing
+             * and tools/fbdump-to-png.py needs no mode switch. */
+            const uint32_t *src = &fb32[(y * STEP) * FB_W];
+            for(x = 0; x < OUT_W; x++) {
+                uint32_t p = src[x * STEP];
+                row[x] = (uint16_t)((((p >> 16) & 0xf8) << 8) |
+                                    (((p >> 8)  & 0xfc) << 3) |
+                                    (( p        & 0xf8) >> 3));
+            }
+        }
+        else {
+            const uint16_t *src = &fb[(y * STEP) * FB_W];
+            for(x = 0; x < OUT_W; x++) {
+                row[x] = src[x * STEP];
+            }
         }
         emit_row(row);
     }

@@ -17,6 +17,7 @@
 #include "game_config.h"
 #include "dc_input.h"
 #include "tr_harness.h"
+#include "dc_fbdump.h"
 
 #include <setjmp.h>
 
@@ -330,6 +331,51 @@ void winsys_set_passive_motion_func( winsys_motion_func_t func )
 void winsys_swap_buffers()
 {
     glKosSwapBuffers();
+
+#ifdef TR_HARNESS
+    /*
+     * One PERF line per second, never per frame: at 1.5 Mbps a console line
+     * still costs real emulated time, and the harness explicitly forbids
+     * logging inside a timed window. Once a second is enough to prove the loop
+     * is alive and to gate the frame budget in harness/dc/perf.sh, and it is
+     * the only frame-rate number this project has -- upstream's own fps
+     * counter (src/fps.c) only ever draws to the HUD.
+     */
+    {
+        static uint64 t_last = 0;
+        static int    frames = 0;
+        uint64        now = timer_ms_gettime64();
+
+        frames++;
+
+        /* TR_FBDUMP_FRAME=<n> ships frame n to the host as a picture
+         * (dc/src/dc_fbdump.c). Off unless the build asks for it: the dump
+         * costs ~1.4 s of console time and would wreck any timing around it. */
+#ifdef TR_FBDUMP_FRAME
+        {
+            static int total = 0;
+            if(++total == (TR_FBDUMP_FRAME)) {
+                tr_fbdump();
+            }
+        }
+#endif
+
+        if(t_last == 0) {
+            t_last = now;
+            TR_MARK("FIRST_FRAME");
+        }
+        else if(now - t_last >= 1000) {
+            TR_PERF("fps=%d frame_ms=%d mode=%d end=%u drawelem=%u calllist=%u",
+                    (int)((frames * 1000ULL) / (now - t_last)),
+                    (int)((now - t_last) / (frames ? frames : 1)),
+                    (int)g_game.mode,
+                    tr_gl_n_end, tr_gl_n_drawelem, tr_gl_n_calllist);
+            tr_gl_n_end = tr_gl_n_drawelem = tr_gl_n_calllist = 0;
+            t_last = now;
+            frames = 0;
+        }
+    }
+#endif
 }
 
 

@@ -29,6 +29,10 @@
 #include <string.h>
 #include <math.h>
 
+/* glGenerateMipmap lives in glext.h, not gl.h. dc/include/GL/glext.h shadows
+ * the kos-ports header and #include_next-s it, so this gets both. */
+#include <GL/glext.h>
+
 #include "tr_glcompat.h"
 
 #undef glBegin
@@ -67,6 +71,10 @@
     } while (0)
 
 int tr_gl_imm_hook = 0;
+
+unsigned tr_gl_n_end      = 0;
+unsigned tr_gl_n_drawelem = 0;
+unsigned tr_gl_n_calllist = 0;
 
 /* ==========================================================================
  * Shadowed GL state
@@ -409,6 +417,7 @@ static void tr_restore_arrays(GLboolean vtx, GLboolean nrm,
 
 void glCallList(GLuint list)
 {
+    tr_gl_n_calllist++;
     tr_list_t *l;
 
     if (list == 0 || list > TR_MAX_LISTS) {
@@ -777,23 +786,41 @@ GLint tr_gluBuild2DMipmaps(GLenum target, GLint internalFormat,
     }
 
     /*
-     * GLdc refuses to build mipmaps for a non-square texture -- glGenerateMipmap
-     * throws GL_INVALID_OPERATION with "Mipmaps cannot be supported on
-     * non-square textures" (MEASURED on the boot texture load; GLdc a1cd80a8).
-     * The upload itself is fine, but GLU has by then set a mipmapping min
-     * filter with no mip chain behind it, which samples garbage.
+     * GLdc's own gluBuild2DMipmaps THROWS THE CALLER'S FORMAT AWAY
+     * (GLdc a1cd80a8, GL/glu.c):
      *
-     * So for non-square textures, do the upload ourselves and pin a non-mipmap
-     * filter. The cost is aliasing on those textures when minified; the
-     * alternative is a corrupt sample, which is what was on screen.
+     *     glTexImage2D(GL_TEXTURE_2D, 0, 3, width, height, 0,
+     *                  GL_RGB, GL_UNSIGNED_BYTE, data);
+     *     glGenerateMipmap(GL_TEXTURE_2D);
      *
-     * Square textures keep the GLU path, mip chain and all.
+     * -- internalFormat, format and type are all hardcoded. src/textures.c:160
+     * uploads RGBA for every texture whose SGI RGB file has 4 channels, which
+     * is most of them, so GLdc read 4-byte pixels as 3-byte ones. Every
+     * subsequent pixel in the row is shifted by one more byte, which is
+     * EXACTLY the failure that was on screen: the splash logo repeated ~5 times
+     * across its 512 px quad, in magenta/green vertical stripes, while the
+     * untextured background and snow particles beside it were perfect.
+     *
+     * So: never delegate to GLdc's GLU here. Upload with the real format.
+     *
+     * The mip chain is then ours to ask for, and only when GLdc will accept
+     * it: glGenerateMipmap throws GL_INVALID_OPERATION with "Mipmaps cannot be
+     * supported on non-square textures" (also MEASURED). For those, pin a
+     * non-mipmap filter, because GLU's default leaves a mipmapping min filter
+     * with no chain behind it and samples garbage. The cost is aliasing when
+     * minified.
      */
-    if (target == GL_TEXTURE_2D && width != height) {
+    if (target == GL_TEXTURE_2D) {
         glTexImage2D(target, 0, internalFormat, width, height, 0,
                      format, type, data);
-        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+        if (width == height) {
+            glGenerateMipmap(GL_TEXTURE_2D);
+        }
+        else {
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        }
         return 0;
     }
 
@@ -1014,6 +1041,7 @@ static void tr_gen_spheremap(GLuint idx, const GLfloat *mv, GLfloat *dst)
 void tr_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices)
 {
     GLuint maxidx = 0;
+    tr_gl_n_drawelem++;
     GLsizei i;
     GLfloat *tc;
     int spheremap;

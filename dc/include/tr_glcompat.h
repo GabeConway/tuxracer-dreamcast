@@ -204,6 +204,15 @@ GLint gluScaleImage(GLenum format,
  * Read on every immediate-mode vertex, so it lives in the header. */
 extern int tr_gl_imm_hook;
 
+/* Draw-call census. Incremented by the shim, printed once a second by
+ * dc/src/dc_winsys.c under TR_HARNESS. This is the instrument that separates
+ * "the game submitted no geometry" from "the game submitted geometry and the
+ * PVR showed black", which are completely different bugs and look identical
+ * from the outside. */
+extern unsigned tr_gl_n_end;      /* glEnd, i.e. immediate-mode primitives */
+extern unsigned tr_gl_n_drawelem; /* glDrawElements */
+extern unsigned tr_gl_n_calllist; /* glCallList */
+
 void tr_gl_begin_hook(GLenum mode);
 void tr_gl_end_hook(void);
 void tr_gl_vertex3f_hook(GLfloat x, GLfloat y, GLfloat z);
@@ -220,6 +229,7 @@ static inline void tr_glBegin(GLenum mode) {
 }
 
 static inline void tr_glEnd(void) {
+    tr_gl_n_end++;
     if (__builtin_expect(tr_gl_imm_hook != 0, 0)) { tr_gl_end_hook(); return; }
     glEnd();
 }
