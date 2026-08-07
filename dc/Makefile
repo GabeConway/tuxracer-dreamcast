@@ -131,6 +131,25 @@ CFLAGS_GAME := -std=gnu89 $(TR_OPT)
 CFLAGS_DC   := -std=gnu99 $(TR_DC_OPT)
 CXXFLAGS    := $(TR_OPT) -fno-exceptions -fno-rtti
 
+# --- Flag stamp --------------------------------------------------------------
+# make compares TIMESTAMPS, not compiler flags. Change TR_DEFS or TR_OPT and
+# nothing rebuilds, so you get a binary assembled from objects compiled under
+# DIFFERENT flag sets -- half the tree with a diagnostic switch on and half
+# with it off. That is not a theoretical hazard: it cost a long debugging
+# session where a build appeared to hang and the "fix" was whichever TU
+# happened to be stale.
+#
+# So: hash the flags into a stamp file, rewrite it only when the hash changes,
+# and make every object depend on it.
+FLAGSIG := $(COMMON)|$(CFLAGS_GAME)|$(CFLAGS_DC)|$(CXXFLAGS)
+FLAGSTAMP := $(BUILD)/flags.stamp
+
+$(shell mkdir -p $(BUILD); \
+        printf '%s' '$(FLAGSIG)' > $(BUILD)/flags.new; \
+        cmp -s $(BUILD)/flags.new $(FLAGSTAMP) \
+          || mv $(BUILD)/flags.new $(FLAGSTAMP); \
+        rm -f $(BUILD)/flags.new)
+
 # --- Rules -------------------------------------------------------------------
 .PHONY: all objs clean count sources
 
@@ -139,17 +158,17 @@ all: $(TARGET)
 objs: $(OBJS)
 	@echo "-- objs: $(words $(OBJS)) TUs compiled, no link."
 
-$(OBJDIR)/src/%.c.o: $(ROOT)/src/%.c
+$(OBJDIR)/src/%.c.o: $(ROOT)/src/%.c $(FLAGSTAMP)
 	@echo "  CC   src/$*.c"
 	$(Q)mkdir -p $(@D) && $(KCC) $(COMMON) $(CFLAGS_GAME) \
 	    -MMD -MP -MF $(@:.o=.d) -MT $@ -c $< -o $@
 
-$(OBJDIR)/dc/src/%.c.o: $(DC_DIR)/src/%.c
+$(OBJDIR)/dc/src/%.c.o: $(DC_DIR)/src/%.c $(FLAGSTAMP)
 	@echo "  CC   dc/src/$*.c"
 	$(Q)mkdir -p $(@D) && $(KCC) $(COMMON) $(CFLAGS_DC) \
 	    -MMD -MP -MF $(@:.o=.d) -MT $@ -c $< -o $@
 
-$(OBJDIR)/src/%.cpp.o: $(ROOT)/src/%.cpp
+$(OBJDIR)/src/%.cpp.o: $(ROOT)/src/%.cpp $(FLAGSTAMP)
 	@echo "  CXX  src/$*.cpp"
 	$(Q)mkdir -p $(@D) && $(KCXX) $(COMMON) $(CXXFLAGS) \
 	    -MMD -MP -MF $(@:.o=.d) -MT $@ -c $< -o $@

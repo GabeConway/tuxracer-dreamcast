@@ -23,10 +23,16 @@ boundary, not in the game.
 
 ## Status
 
-> **Bring-up.** The build system, the SDK image and the Flycast test harness
-> are in place. The compatibility layers are landing now. See
-> [`kb/STATE.md`](kb/STATE.md) for what actually runs today — that file is kept
-> honest, this section is not a roadmap.
+**It plays.** The splash screen, the menus and race-select all render
+correctly, a course loads, and Tux races down it with terrain, trees, fog, the
+HUD and sound — 52 s of continuous racing captured at 13–15 fps, with zero GL
+errors.
+
+It is not finished. Racing is 66–85 ms/frame against a 33.3 ms budget, course
+loading stalls in some builds in a way that looks like a latent memory bug, and
+settings cannot persist because KOS's ramdisk has no `mkdir`.
+[`kb/STATE.md`](kb/STATE.md) is the honest list, updated with every change that
+affects it; this section is not a roadmap.
 
 ## Quick start
 

@@ -3,7 +3,7 @@
 What actually works, as of the last commit that touched this file. Not a
 roadmap. If something is not listed as verified here, assume it is not.
 
-**Updated:** 2026-08-06
+**Updated:** 2026-08-07
 
 ---
 
@@ -24,32 +24,27 @@ roadmap. If something is not listed as verified here, assume it is not.
 
 ## Known broken
 
-- **The screen is black.** The loop runs at 59 fps and the draw-call census
-  says the game submits ~405 immediate-mode primitives per frame
-  (`end=24300` per second at mode 0 / splash), but a direct read of the
-  displayed framebuffer finds 0 of 307,200 pixels non-black. Geometry goes
-  in, nothing comes out. This is the one thing between here and M3.
-- **Settings do not persist.** The config file is written under `/ram`,
-  which is gone at power-off. A VMU save is a different shape of code — one
-  fixed-name file written whole, not a directory — so it belongs in a save
-  layer, not in `getpwuid`'s fake home. See `dc/src/dc_posix.c`.
-- **`glAlphaFunc` is a GLdc no-op** and the game enables `GL_ALPHA_TEST` for
-  trees and particles. Expect tree billboards to blend rather than punch
-  through, and to sort wrong against terrain. Needs GLdc's punch-through
-  list, not a shim fix. Not yet seen, because nothing has been seen.
-- **`use_cva` / `cva_hack` are inert options.** GLdc has no compiled vertex
-  arrays; `SDL_GL_GetProcAddress` returns NULL by design, so the game takes
-  its own extension-absent path either way.
-
-## Not yet measured
-
-- Frame budget with a course rendering. The 59 fps above is a splash screen.
-- Whether KOS's iso9660 driver returns the lowercase Rock Ridge names or the
-  uppercase 8.3 ones (`kb/design-disc.md`). Course loading appeared to work,
-  which is weak evidence for lowercase, but no one has read a course asset
-  by path and confirmed it.
-- Any optimisation level. `-O2` is the default because it is the sensible
-  default, not because it was benchmarked.
+- **Course loading stalls in some builds.** After race-select the guest goes
+  silent and never reaches the racing view — no crash dump, no assert, just
+  silence to the deadline (reproduced at 200 s, 320 s and 600 s). A build
+  compiled with `-DTR_FBDUMP_FRAME=380 -DTR_FBDUMP_FULL=1` loads the same
+  course in ~40 s and then races for 52 s straight at 13–15 fps. The only
+  difference is ~1.5 KB of `.bss`, which is why this is being treated as a
+  latent memory bug rather than a rendering one. `kb/design-perf.md` has the
+  next step. **This is the top open issue.**
+- **Racing runs at 12–15 fps**, 66–85 ms against a 33.3 ms budget. Menus are
+  vsync-locked at 59. Levers are ranked in `kb/design-perf.md`; none applied.
+- **Settings do not persist.** KOS's ramdisk has no `mkdir`
+  (`fs_ramdisk.c:778`) and the VMU filesystem is flat, so
+  `<home>/.tuxracer/options` cannot exist. Needs a VMU save layer.
+- **Track marks render as a rainbow smear** on the snow behind Tux. Not
+  diagnosed. Trees and terrain are correct.
+- **Texgen emulation degrades tree billboards.** With `-DTR_TEXGEN_DISABLE`
+  the trees render clean green and the terrain loses its texture, which is the
+  trade the switch exists to expose. Not resolved.
+- Textures are downscaled to 128 px inside `tr_gluBuild2DMipmaps` to fit
+  8 MB of VRAM (`kb/design-perf.md`, the commit that added it). Visible on
+  close-up UI art. The *layout* is unaffected — that was the point.
 
 ## Milestones
 
@@ -58,6 +53,6 @@ roadmap. If something is not listed as verified here, assume it is not.
 | **M0** | Harness green against a known-good ELF | **done** |
 | **M1** | Every TU compiles for sh-elf | **done** |
 | **M2** | Links, boots, reaches the render loop | **done** |
-| **M3** | Something visible on screen | **blocked** — see "Known broken" |
-| **M4** | A course loads and is playable | not started |
-| **M5** | ≤ 33.3 ms/frame with a course rendering | not started |
+| **M3** | Something visible on screen | **done** — splash, menus, race-select all render correctly |
+| **M4** | A course loads and is playable | **done, not reliable** — 52 s of continuous racing captured, but see the stall above |
+| **M5** | ≤ 33.3 ms/frame with a course rendering | not started — currently 66–85 ms |
