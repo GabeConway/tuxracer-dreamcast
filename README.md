@@ -60,10 +60,46 @@ KallistiOS, GLdc, Jim Tcl, libmodplug, `mkdcdisc` — lives inside the
 `tuxracer-dc:sdk` image, so there is nothing to install and nothing to break on
 a macOS upgrade.
 
+## Running a release build
+
+Releases carry a ready-made `TuxRacer.cdi` (the disc image, game data
+included), `tuxracer.elf` (the raw binary, for emulators that boot one) and
+`SHA256SUMS`. Grab the newest from
+[Releases](https://github.com/GabeConway/tuxracer-dreamcast/releases).
+
+**In an emulator.** Open `TuxRacer.cdi` in [Flycast](https://flyca.st/) —
+no BIOS ROM needed, its HLE BIOS boots the image. This is the configuration
+every claim in this README was measured in.
+
+**On real hardware.** Untested. Nobody has run this on a Dreamcast yet, so
+treat it as unknown rather than broken. The release image is built unpadded
+(`mkdcdisc -N`), which is right for emulators; for a CD-R, rebuild with
+`DC_CDI_PAD=1 TR_DATA=./data bash dc/build-dc.sh` so the layout matches what a
+real drive expects. If you do burn one, the fps and any hardware-only faults
+are worth an issue — the harness cannot see them.
+
+**Controls** (`dc/src/dc_winsys.c`, `dc/src/dc_joystick.c`):
+
+| | Racing | Menus |
+|---|---|---|
+| Analogue stick | steer / lean | moves the cursor |
+| D-pad | — | arrow keys |
+| **A** | paddle (same as R) | click / confirm |
+| **R trigger** | paddle | — |
+| **L trigger** | brake | — |
+| **X** | trick | — |
+| **Y** | jump | — |
+| **B** | quit the race (it is Escape) | back |
+| **Start** | Enter | Enter |
+| **L + Start** | pause | pause |
+
+B is deliberately *not* brake: it maps to Escape, which is the in-race quit
+key, so braking with it would abort the run.
+
 Tagged builds are produced by CI: push `v*` and
 [`.github/workflows/release-cdi.yml`](.github/workflows/release-cdi.yml)
-builds the image, fetches and verifies the data, and attaches
-`TuxRacer.cdi` to the GitHub release. Nothing is built on ordinary pushes.
+builds the toolchain image, fetches and sha256-verifies the data, and attaches
+the results to the GitHub release. Nothing is built on ordinary pushes.
 
 ## The development loop
 
