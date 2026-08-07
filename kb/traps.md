@@ -82,3 +82,36 @@ representations through casts. GCC 15 at `-O2` assumes that never happens.
 
 **Check.** `dc/Makefile` passes `-fno-strict-aliasing` to every TU. If someone
 "cleans up the flags", this is the one that must not go.
+
+---
+
+## `## .` — upstream token pastes that no modern cpp accepts
+
+**Symptom.** 26 copies of
+
+```
+src/game_config.c:119:28: error: pasting "." and "int" does not give a valid
+preprocessing token
+```
+
+and nothing else in the file is wrong.
+
+**Cause.** `src/game_config.c:116` and `:310` build member accesses with the
+paste operator:
+
+```c
+#define INIT_PARAM( nam, val, typename, commnt ) \
+   Params. ## nam ## .loaded = False; \
+```
+
+`.` followed by `nam` was never a single preprocessing token, so `. ## nam`
+was always invalid — gcc 2.95 accepted it with a warning, gcc 15 rejects it.
+The pastes are also **pointless**: `nam` is a macro parameter, so plain
+`Params.nam.loaded` expands identically.
+
+**Fix (applied).** One of only two edits to `src/`, in its own commit:
+`s/\. ## /./g; s/ ## \./\./g` over `src/game_config.c`, 12 lines. The
+`getparam_ ## name` and `typename ## _val` pastes are legitimate and were left
+alone.
+
+**Check.** `grep -rn '\. ##\|## \.' src/` must return nothing.
