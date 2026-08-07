@@ -41,11 +41,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # The toolchain image is the expensive part (~27 min from debian:bookworm).
-      # It only changes when its recipe does, so key the cache on the recipe.
-      - name: Cache toolchain image
+      # The toolchain image is the expensive part -- ~24 min from
+      # debian:bookworm on this runner. It only changes when its recipe does,
+      # so the cache is keyed on the recipe.
+      #
+      # restore/save rather than the combined action on purpose: the combined
+      # form only saves in a post step, which is SKIPPED when a later step
+      # fails, so a build that got the image right and then tripped over
+      # something trivial threw the 24 minutes away. This banks it immediately.
+      - name: Restore toolchain image
         id: sdk-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/tuxracer-dc-sdk
           key: sdk-${{ runner.arch }}-${{ hashFiles('dc/Dockerfile', 'dc/Dockerfile.overlay') }}
@@ -63,6 +69,14 @@ jobs:
           mkdir -p ~/.cache/tuxracer-dc-sdk
           docker save tuxracer-dc:sdk -o ~/.cache/tuxracer-dc-sdk/sdk.tar
 
+      - name: Save toolchain image
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        continue-on-error: true      # a cache hiccup must not fail a release
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/tuxracer-dc-sdk
+          key: sdk-${{ runner.arch }}-${{ hashFiles('dc/Dockerfile', 'dc/Dockerfile.overlay') }}
+
       # Keyed on the checksums in fetch-data.sh, so a changed pin misses.
       - name: Cache upstream tarballs
         uses: actions/cache@v4
@@ -79,11 +93,15 @@ jobs:
       - name: Build CDI
         run: TR_DATA=./data bash dc/build-dc.sh
 
+      # Written to the workspace root, NOT into dc/build: the build runs in a
+      # container as root, so dc/build is root-owned and the runner user
+      # cannot create a file there.
       - name: Checksums
         run: |
-          cd dc/build
-          sha256sum TuxRacer.cdi tuxracer.elf | tee SHA256SUMS
-          ls -l TuxRacer.cdi tuxracer.elf
+          sha256sum dc/build/TuxRacer.cdi dc/build/tuxracer.elf \
+            | sed 's|dc/build/||' > SHA256SUMS
+          cat SHA256SUMS
+          ls -l dc/build/TuxRacer.cdi dc/build/tuxracer.elf
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
@@ -92,7 +110,7 @@ jobs:
           path: |
             dc/build/TuxRacer.cdi
             dc/build/tuxracer.elf
-            dc/build/SHA256SUMS
+            SHA256SUMS
           if-no-files-found: error
 
       # A tag push attaches to that tag's release, creating it if the tag was
@@ -106,5 +124,5 @@ jobs:
           gh release view "$TAG" >/dev/null 2>&1 || \
             gh release create "$TAG" --title "$TAG" --generate-notes
           gh release upload "$TAG" \
-            dc/build/TuxRacer.cdi dc/build/tuxracer.elf dc/build/SHA256SUMS \
+            dc/build/TuxRacer.cdi dc/build/tuxracer.elf SHA256SUMS \
             --clobber
