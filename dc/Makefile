@@ -100,6 +100,30 @@ else
   HARNESS_DEFS :=
 endif
 
+# ⚠️ WORKAROUND, NOT A FEATURE. Read kb/design-perf.md "Open problem" before
+# touching this line.
+#
+# Without -DTR_FBDUMP_FRAME the build stalls after race-select and never
+# reaches the racing view: the guest goes silent, no crash dump, no assert,
+# reproduced at 200 s, 320 s and 600 s deadlines. WITH it the same source
+# loads the course in ~40 s and races for 54 s straight, repeatedly.
+#
+# The value below is deliberately larger than any reachable frame number, so
+# the dump NEVER FIRES. MEASURED: it races anyway. That rules out the ~5 s
+# pause the dump costs and leaves only what its presence changes -- ~1.5 KB of
+# statics kept alive plus a few instructions in winsys_swap_buffers. A build
+# difference that changes only memory layout deciding whether a load completes
+# is a latent memory bug, and this line is masking it, not fixing it.
+#
+# It is here because a game that plays beats a game that stalls while the real
+# bug is hunted. Set TR_FBDUMP_FRAME to a real frame number to capture a
+# screenshot (tools/fbdump.sh does), or to 0 to remove the workaround and
+# reproduce the stall.
+TR_FBDUMP_FRAME ?= 999999
+ifneq ($(TR_FBDUMP_FRAME),0)
+  HARNESS_DEFS += -DTR_FBDUMP_FRAME=$(TR_FBDUMP_FRAME) -DTR_FBDUMP_FULL=1
+endif
+
 # -include tr_glcompat.h: the GL shim (dc/include/tr_glcompat.h, dc/src/gl_compat.c)
 # must be in front of EVERY TU, not just the ones that obviously touch GL.
 # It does two jobs that both require this: it declares the ~20 entry points
@@ -183,7 +207,7 @@ $(TARGET): $(OBJS)
 	@mkdir -p $(@D)
 	@echo "  LD   $@"
 	$(Q)$(KCXX) -o $@ $(OBJS) -lGLU -lGL -lmodplug -ljim -lz -lm \
-	    -Wl,-Map,$(MAPFILE)
+	    $(TR_LDFLAGS) -Wl,-Map,$(MAPFILE)
 	@sh-elf-size $@ || true
 
 clean:

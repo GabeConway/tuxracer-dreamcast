@@ -20,6 +20,7 @@
 #include "dc_fbdump.h"
 
 #include <setjmp.h>
+#include <stdlib.h>
 
 #include <kos/timer.h>
 #include <kos/thread.h>
@@ -356,6 +357,32 @@ void winsys_swap_buffers()
             static int total = 0;
             if(++total == (TR_FBDUMP_FRAME)) {
                 tr_fbdump();
+            }
+        }
+#endif
+
+        /* One mark the moment the game first reaches the racing view. This is
+         * what turns "it boots" into a real regression gate: harness/dc/
+         * playtest.sh asserts on it, so a change that breaks course loading
+         * fails a check instead of being noticed weeks later in a screenshot. */
+        {
+            static int raced = 0;
+            if(!raced && g_game.mode == RACING) {
+                raced = 1;
+                TR_MARK("RACING");
+            }
+        }
+
+#ifdef TR_AUTOEXIT
+        /* End the run cleanly after N frames so the harness gets its END
+         * marker. A game never exits on its own, and neither does Flycast, so
+         * without this every gate can only ever end in a timeout -- which is
+         * indistinguishable from a hang. */
+        {
+            static int total_ae = 0;
+            if(++total_ae >= (TR_AUTOEXIT)) {
+                tr_harness_end(0);
+                exit(0);
             }
         }
 #endif

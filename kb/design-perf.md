@@ -63,33 +63,60 @@ course loads — and then it turned out the same stall reproduces **without** it
 See the open problem below. The lever is real; it should go back in once that
 is understood, not before.
 
-## Open problem: course loading stalls, and it is layout-sensitive
+## Open problem: course loading stalls, and it is EXTREMELY layout-sensitive
 
-**Symptom.** After the race-select screen, the guest stops printing and never
+**This is the top open issue in the project.** Everything else here is
+secondary to it.
+
+**Symptom.** After the race-select screen the guest stops printing and never
 reaches mode 5/6. Not a crash: no register dump, no assert, no fail marker —
-just silence until the runner's deadline. Reproduced at 200 s, 320 s and 600 s
-timeouts.
+silence until the deadline. Reproduced at 200 s, 320 s and 600 s.
 
-**But it is not universal.** A build compiled with
-`-DTR_FBDUMP_FRAME=380 -DTR_FBDUMP_FULL=1` loads the same course in ~40 s and
-then races for 52 s straight, repeatedly, at 13–15 fps. That is the run every
-racing screenshot in this repo came from. The only difference between the two
-binaries is the framebuffer-dump code — which changes `.bss` by about 1.5 KB
-and nothing else.
+**It is decided by memory layout, and by nothing else.** Four measurements,
+all on the same source, all with the flag-stamp rebuild in place so no
+mixed-flag binary is involved:
 
-**A build difference that changes only memory layout, changing whether a load
-completes, reads as a latent memory bug** — 16 MB is tight (2.33 MB of `.bss`
-before the heap), and course loading is the peak allocation: the mesh, the
-`.rgb` decode buffers and `tr_gluBuild2DMipmaps`'s downscale scratch are all
+| Build | Result |
+|---|---|
+| plain | stalls at race-select, every time |
+| `-DTR_FBDUMP_FRAME=380 -DTR_FBDUMP_FULL=1` | loads in ~40 s, races 54 s, repeatedly |
+| `-DTR_FBDUMP_FRAME=999999 -DTR_FBDUMP_FULL=1` (**never fires**) | races, same as above |
+| default + `-DTR_AUTOEXIT=1500` | stalls again |
+
+The third row is the important one. The dump never runs, so the ~5 s pause it
+costs is not the mechanism. What remains is ~1.5 KB of statics kept alive and a
+handful of instructions in `winsys_swap_buffers`. The fourth row shows that
+adding a *different* small amount of code puts it back.
+
+**A build difference that changes only layout deciding whether a course load
+completes is a latent memory bug.** 16 MB is tight — 2.33 MB of `.bss` before
+the heap even starts — and course loading is peak allocation: the terrain mesh,
+the `.rgb` decode buffers and `tr_gluBuild2DMipmaps`'s downscale scratch are all
 live at once.
 
-**Next step**, and do this before any optimisation work: instrument the KOS
-heap around `load_course` (`malloc_stats`, or KOS's `mallinfo`) and print the
-high-water mark. If it is near the ceiling, the fix is to free the decode
-buffer before the downscale rather than after, and to shrink `.bss`.
+**What did NOT work as a probe:** a `volatile unsigned char pad[2048]` in its
+own TU. The ELF came out byte-identical in size because `$KOS_LDFLAGS` carries
+`-Wl,--gc-sections` and `-fdata-sections` puts it in its own section, so the
+linker dropped it. Any future padding probe must be referenced from live code.
+`-Wl,--no-gc-sections` does not link at all (tried; `ld` fails).
 
-**Do not** trust a timing measurement taken from a build that cannot complete
-a load. Every number in the table above came from a run that did.
+**The workaround that is currently shipping.** `dc/Makefile` defines
+`TR_FBDUMP_FRAME ?= 999999`, which keeps the dump code alive and never fires
+it, because a game that plays beats a game that stalls. It is labelled as a
+workaround at the definition site. `TR_FBDUMP_FRAME=0` removes it and
+reproduces the stall.
+
+**Next step.** Instrument the KOS heap around `load_course` — `mallinfo()` /
+`malloc_stats()` before, during and after — and print the high-water mark. If
+it is near the ceiling, free the `.rgb` decode buffer before the downscale
+rather than after, and shrink `.bss`. If it is not, the next suspect is a
+fixed-size buffer in the course loader or in `tr_gluBuild2DMipmaps`'s scratch.
+
+**`harness/dc/playtest.sh` is blocked on this.** It builds with `TR_AUTOKEY`
+and `TR_AUTOEXIT` so the run can end on a marker instead of a timeout, and
+asserts `MARK:RACING` — but the extra `TR_AUTOEXIT` code is itself enough to
+trigger the stall, so the gate currently fails on a build that is otherwise
+fine. Fix the memory bug and the gate starts working; do not "fix" the gate.
 
 ## Not yet measured
 

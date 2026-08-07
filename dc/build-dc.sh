@@ -46,8 +46,10 @@ ENVARGS=(
 [ -n "${TR_OPT+x}"    ] && ENVARGS+=(-e TR_OPT="$TR_OPT")
 [ -n "${TR_DC_OPT+x}" ] && ENVARGS+=(-e TR_DC_OPT="$TR_DC_OPT")
 [ -n "${TR_DEFS+x}"   ] && ENVARGS+=(-e TR_DEFS="$TR_DEFS")
+[ -n "${TR_LDFLAGS+x}" ] && ENVARGS+=(-e TR_LDFLAGS="$TR_LDFLAGS")
 [ -n "${V+x}"         ] && ENVARGS+=(-e V="$V")
 [ -n "${TR_HARNESS+x}" ] && ENVARGS+=(-e TR_HARNESS="$TR_HARNESS")
+[ -n "${TR_FBDUMP_FRAME+x}" ] && ENVARGS+=(-e TR_FBDUMP_FRAME="$TR_FBDUMP_FRAME")
 
 # TR_DATA=<dir> puts the game data on the disc. It is mounted read-only at
 # /discroot and handed to mkdcdisc with -D (contents, not the directory

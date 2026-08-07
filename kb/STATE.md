@@ -24,14 +24,14 @@ roadmap. If something is not listed as verified here, assume it is not.
 
 ## Known broken
 
-- **Course loading stalls in some builds.** After race-select the guest goes
-  silent and never reaches the racing view — no crash dump, no assert, just
-  silence to the deadline (reproduced at 200 s, 320 s and 600 s). A build
-  compiled with `-DTR_FBDUMP_FRAME=380 -DTR_FBDUMP_FULL=1` loads the same
-  course in ~40 s and then races for 52 s straight at 13–15 fps. The only
-  difference is ~1.5 KB of `.bss`, which is why this is being treated as a
-  latent memory bug rather than a rendering one. `kb/design-perf.md` has the
-  next step. **This is the top open issue.**
+- **Course loading stalls, and it is decided purely by memory layout.**
+  Four builds of identical source: plain stalls; with the framebuffer-dump
+  code present it races (even with the dump set to a frame number that never
+  arrives); adding `TR_AUTOEXIT` instead makes it stall again. That is a
+  latent memory bug, not a rendering one. `dc/Makefile` currently ships a
+  labelled workaround (`TR_FBDUMP_FRAME ?= 999999`) so the default build
+  plays. **Top open issue** — full evidence and the next step in
+  `kb/design-perf.md`.
 - **Racing runs at 12–15 fps**, 66–85 ms against a 33.3 ms budget. Menus are
   vsync-locked at 59. Levers are ranked in `kb/design-perf.md`; none applied.
 - **Settings do not persist.** KOS's ramdisk has no `mkdir`
@@ -54,5 +54,5 @@ roadmap. If something is not listed as verified here, assume it is not.
 | **M1** | Every TU compiles for sh-elf | **done** |
 | **M2** | Links, boots, reaches the render loop | **done** |
 | **M3** | Something visible on screen | **done** — splash, menus, race-select all render correctly |
-| **M4** | A course loads and is playable | **done, not reliable** — 52 s of continuous racing captured, but see the stall above |
+| **M4** | A course loads and is playable | **done** with a labelled workaround — 52 s of continuous racing, repeatedly; see the stall above |
 | **M5** | ≤ 33.3 ms/frame with a course rendering | not started — currently 66–85 ms |

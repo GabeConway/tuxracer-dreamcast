@@ -28,7 +28,7 @@ DATA="${TR_DATA:-$REPO/data-dc}"
 touch "$REPO/dc/src/dc_winsys.c" "$REPO/dc/src/dc_fbdump.c"
 
 echo "-- building with TR_FBDUMP_FRAME=$FRAME"
-TR_DEFS="-DTR_FBDUMP_FRAME=$FRAME" TR_DATA="$DATA" bash "$REPO/dc/build-dc.sh" \
+TR_FBDUMP_FRAME="$FRAME" TR_DATA="$DATA" bash "$REPO/dc/build-dc.sh" \
     | grep -E 'CDI:|error' || true
 
 # The dump is ~205 KB of base64 at ~150 KB/s, so allow generously more wall
