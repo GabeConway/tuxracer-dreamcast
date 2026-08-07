@@ -115,3 +115,63 @@ The pastes are also **pointless**: `nam` is a macro parameter, so plain
 alone.
 
 **Check.** `grep -rn '\. ##\|## \.' src/` must return nothing.
+
+---
+
+## `sh-elf-nm` reports no symbols for anything GL — they are LTO objects
+
+**Symptom.** Enumerating what GLdc actually exports:
+
+```
+sh-elf-nm --defined-only $KOS_PORTS/lib/libGL.a | grep " T "
+```
+
+prints **nothing**. The same happens on the build's own `dc/build/obj/**/*.o`.
+It reads exactly like "the library is empty" or "that symbol is missing".
+
+**Cause.** kos-ports builds `libGL.a` with slim LTO, and `kos-cc` emits LTO
+objects too. Plain `nm` cannot read them; the real message is buried above the
+output:
+
+```
+sh-elf-nm: aligned_vector.c.obj: plugin needed to handle lto object
+```
+
+**Fix.** Use **`sh-elf-gcc-nm`**, which loads the LTO plugin. Two further
+gotchas once it works: symbols carry a leading underscore (`sed 's/^_//'`), and
+grepping only for `" T "` misses data — `glLockArraysEXT_p` is `B` (`.bss`), so
+grep `[TDB]` when checking whether a symbol is defined anywhere.
+
+**Check.** `sh-elf-gcc-nm --defined-only $KOS_PORTS/lib/libGL.a | grep -c " T "`
+should print ~200, not 0.
+
+---
+
+## GLdc's headers declare functions its library does not define
+
+**Symptom.** `glKosGetMatrix(GL_MODELVIEW, m)` compiles cleanly — it is
+prototyped at `$KOS_PORTS/include/GL/gl.h:713` — and then fails at link with an
+undefined reference.
+
+**Cause.** GLdc's `GL/gl.h` and `libGL.a` are out of sync. `glKosGetMatrix` is
+declared but never defined. There is no GLdc *source* in the SDK image (only
+`libGL/inst/{include,lib,examples}`), so the header is the only documentation
+available and it is not trustworthy.
+
+**Fix.** Treat the header as a claim, not evidence. Before relying on any GLdc
+entry point, confirm it is in the `sh-elf-gcc-nm` export list (above). For the
+modelview specifically, `glGetFloatv(GL_MODELVIEW_MATRIX, m)` is the exported
+alternative — though whether GLdc honours that *pname* is itself unverified, so
+`dc/src/gl_compat.c` seeds the matrix to identity first rather than trusting it.
+
+**Check.** Diff called-vs-exported before writing the call, not after the link:
+
+```
+comm -23 <(called symbols) <(sh-elf-gcc-nm --defined-only ... | grep " T ")
+```
+
+Note this also cuts the other way: `GL/gl.h:754-764` *defines* a block of
+functions under the comment "Non Operational Stubs for portability"
+(`glAlphaFunc`, `glStencilFunc`, `glStencilOp`, `glGetTexParameteriv`,
+`glColorMask`, `glPixelStorei`, ...). They link and silently do nothing, which
+is worse than absent. See `kb/design-gl.md` §5.

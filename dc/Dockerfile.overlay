@@ -18,19 +18,40 @@ FROM opencrossing-dc:sdk
 
 ARG JOBS=4
 
-# libjimtcl — Jim Tcl. Tux Racer's data files (courses, tux.tcl, the init
-# script) are real Tcl: proc, regexp, catch, open/gets, while, expr, global,
-# source. A hand-rolled mini-interpreter would have to reimplement all of
-# that, so we take a real one. Jim is ~10x smaller than Tcl 8.x and needs no
-# POSIX beyond what KOS has. dc/src/tcl_compat.c maps the 35 Tcl_* entry
-# points the game calls onto Jim_*.
-#
 # libmodplug — the soundtrack is Impulse Tracker (.it) modules, which is what
 # this decodes. Without it the game is silent; SDL_mixer, which upstream used,
 # has no KOS port.
 RUN bash -c '. /opt/toolchains/dc/kos/environ.sh \
-      && make -C "$KOS_PORTS/libjimtcl"  install clean \
       && make -C "$KOS_PORTS/libmodplug" install clean'
+
+# libjimtcl — Jim Tcl, PATCHED. Tux Racer's data files are real Tcl (proc,
+# regexp, catch, open/gets, source), so the game needs a real interpreter;
+# dc/src/tcl_compat.c maps the 35 Tcl_* entry points it calls onto Jim_*.
+#
+# The patch fixes a genuine Tcl incompatibility in Jim's list parser:
+# backslash-newline is WHITESPACE in Tcl list syntax, and Jim treats it as an
+# escape inside a word. MEASURED on data/courses/course_idx.tcl:106 —
+# tclsh reports llength 2, stock jimsh reports 5 — and the unpatched build
+# exits at boot with "No course specified in open course data".
+#
+# It is applied here rather than carried as a fork because it is four lines
+# against a moving upstream; tools/gen-jim-patch.py regenerates it and asserts
+# its three anchors, so a libjimtcl bump fails loudly instead of silently
+# not applying.
+#
+# The patch goes into dist/, NOT build/. kos-ports' `unpack` target is phony
+# and starts with `rm -rf build` (scripts/unpack.mk:7), and `install` depends
+# on it through build-stamp — so a patch applied to build/ is deleted by the
+# very next make and the port silently compiles pristine source. That cost a
+# full boot cycle to find: the guest printed `split n=19` where the host's
+# patched jimsh printed 5. `unpack` copies from dist/, so patching there is
+# what survives. The grep is the tripwire.
+COPY third_party/jim-list-backslash-newline.patch /tmp/jim.patch
+RUN bash -c '. /opt/toolchains/dc/kos/environ.sh \
+      && make -C "$KOS_PORTS/libjimtcl" fetch \
+      && patch -d "$KOS_PORTS/libjimtcl/dist/libjimtcl-1.0.0" -p1 < /tmp/jim.patch \
+      && grep -q JimListIsBackslashNewline "$KOS_PORTS/libjimtcl/dist/libjimtcl-1.0.0/jim.c" \
+      && make -C "$KOS_PORTS/libjimtcl" install'
 
 WORKDIR /work
 ENTRYPOINT ["/usr/local/bin/dc-env"]

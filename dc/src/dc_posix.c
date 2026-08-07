@@ -9,6 +9,8 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <pwd.h>
+#include <unistd.h>
 
 #include <sys/utsname.h>
 
@@ -38,4 +40,47 @@ int uname(struct utsname *buf) {
     strncpy(buf->machine,  "sh4",               sizeof(buf->machine) - 1);
 
     return 0;
+}
+
+/*
+ * getuid(2) / getpwuid(3). newlib declares both and defines neither; the
+ * single consumer is src/game_config.c:843, which builds the config directory
+ * path as "<pw_dir>/<CONFIG_DIR>" and then writes the options file into it.
+ *
+ * pw_dir is "/ram" — KOS's in-memory filesystem — and NOT "/cd", which is a
+ * read-only ISO9660 mount and would fail every write, and not "/vmu/a1"
+ * either: game_config.c mkdir()s the directory and then opens a file inside
+ * it, and the VMU filesystem is flat, with no subdirectories at all.
+ *
+ * CONSEQUENCE, and it is a real one: settings do not survive a power cycle.
+ * Persisting them means a VMU save, which is a different shape of code — one
+ * fixed-name save file written whole, not a directory — so it belongs in a
+ * save layer, not in a fake passwd entry. Tracked in kb/STATE.md.
+ */
+uid_t getuid(void) {
+    return 0;
+}
+
+struct passwd *getpwuid(uid_t uid) {
+    /* Static storage is correct here: getpwuid() is specified to return a
+     * pointer to a static buffer that the next call may overwrite, and there
+     * is exactly one caller, once, at startup. */
+    static char name[]  = "dreamcast";
+    static char dir[]   = "/ram";
+    static char shell[] = "";
+    static char empty[] = "";
+    static struct passwd pw;
+
+    (void)uid;
+
+    pw.pw_name    = name;
+    pw.pw_passwd  = empty;
+    pw.pw_uid     = 0;
+    pw.pw_gid     = 0;
+    pw.pw_comment = empty;
+    pw.pw_gecos   = empty;
+    pw.pw_dir     = dir;
+    pw.pw_shell   = shell;
+
+    return &pw;
 }

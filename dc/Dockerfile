@@ -83,8 +83,28 @@ RUN git clone https://github.com/KallistiOS/kos-ports.git /opt/toolchains/dc/kos
  && bash -c '. /opt/toolchains/dc/kos/environ.sh \
       && make -C "$KOS_PORTS/zlib"  install clean \
       && make -C "$KOS_PORTS/libGL" install clean GIT_CHANGESET="$GLDC_SHA" \
-      && make -C "$KOS_PORTS/libjimtcl"  install clean \
       && make -C "$KOS_PORTS/libmodplug" install clean'
+
+# libjimtcl, PATCHED. Backslash-newline is WHITESPACE in Tcl list syntax and
+# Jim's parser treats it as an escape inside a word. MEASURED on
+# data/courses/course_idx.tcl:106 — tclsh reports llength 2, stock jimsh
+# reports 5 — and the unpatched build exits at boot with "No course specified
+# in open course data". tools/gen-jim-patch.py regenerates the patch and
+# asserts its anchors, so a libjimtcl bump fails loudly.
+#
+# The patch goes into dist/, NOT build/. kos-ports' `unpack` target is phony
+# and starts with `rm -rf build` (scripts/unpack.mk:7), and `install` depends
+# on it through build-stamp — so a patch applied to build/ is deleted by the
+# very next make and the port silently compiles pristine source. That cost a
+# full boot cycle to find: the guest printed `split n=19` where the host's
+# patched jimsh printed 5. `unpack` copies from dist/, so patching there is
+# what survives. The grep is the tripwire.
+COPY third_party/jim-list-backslash-newline.patch /tmp/jim.patch
+RUN bash -c '. /opt/toolchains/dc/kos/environ.sh \
+      && make -C "$KOS_PORTS/libjimtcl" fetch \
+      && patch -d "$KOS_PORTS/libjimtcl/dist/libjimtcl-1.0.0" -p1 < /tmp/jim.patch \
+      && grep -q JimListIsBackslashNewline "$KOS_PORTS/libjimtcl/dist/libjimtcl-1.0.0/jim.c" \
+      && make -C "$KOS_PORTS/libjimtcl" install'
 
 # mkdcdisc (host tool, ELF -> CDI)
 RUN git clone https://gitlab.com/simulant/mkdcdisc.git /tmp/mkdcdisc \

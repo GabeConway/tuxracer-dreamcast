@@ -1,0 +1,65 @@
+--- a/jim.c
++++ b/jim.c
+@@ -2117,10 +2117,25 @@
+ static int JimParseListStr(struct JimParserCtx *pc);
+ static int JimParseListQuote(struct JimParserCtx *pc);
+ 
++/* Tcl list syntax: a backslash-newline pair is WHITESPACE - an element
++ * separator - not part of an element. Jim's list parser instead treats it as
++ * an escape inside a word, so `{ a \<nl> b }` parses as three elements where
++ * Tcl gives two.
++ *
++ * MEASURED on the same input (data/courses/course_idx.tcl:106, which is
++ * written that way throughout): tclsh 8.6 reports llength 2, stock jimsh
++ * reports 5. Without this the whole course list is garbage and the game exits
++ * at boot with "No course specified in open course data".
++ */
++static int JimListIsBackslashNewline(struct JimParserCtx *pc)
++{
++    return pc->len >= 2 && pc->p[0] == '\\' && pc->p[1] == '\n';
++}
++
+ /* Parse the next token from a Tcl list string. */
+ static int JimParseList(struct JimParserCtx *pc)
+ {
+-    if (isspace(UCHAR(*pc->p))) {
++    if (isspace(UCHAR(*pc->p)) || JimListIsBackslashNewline(pc)) {
+         return JimParseListSep(pc);
+     }
+     switch (*pc->p) {
+@@ -2149,12 +2164,22 @@
+ {
+     pc->tstart = pc->p;
+     pc->tline = pc->linenr;
+-    while (isspace(UCHAR(*pc->p))) {
+-        if (*pc->p == '\n') {
++    while (pc->len) {
++        if (isspace(UCHAR(*pc->p))) {
++            if (*pc->p == '\n') {
++                pc->linenr++;
++            }
++            pc->p++;
++            pc->len--;
++        }
++        else if (JimListIsBackslashNewline(pc)) {
+             pc->linenr++;
++            pc->p += 2;
++            pc->len -= 2;
++        }
++        else {
++            break;
+         }
+-        pc->p++;
+-        pc->len--;
+     }
+     pc->tend = pc->p - 1;
+     pc->tt = JIM_TT_SEP;
+@@ -2207,7 +2232,7 @@
+     pc->tt = JIM_TT_STR;
+ 
+     while (pc->len) {
+-        if (isspace(UCHAR(*pc->p))) {
++        if (isspace(UCHAR(*pc->p)) || JimListIsBackslashNewline(pc)) {
+             pc->tend = pc->p - 1;
+             return JIM_OK;
+         }

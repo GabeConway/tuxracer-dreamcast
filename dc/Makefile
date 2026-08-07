@@ -100,7 +100,19 @@ else
   HARNESS_DEFS :=
 endif
 
+# -include tr_glcompat.h: the GL shim (dc/include/tr_glcompat.h, dc/src/gl_compat.c)
+# must be in front of EVERY TU, not just the ones that obviously touch GL.
+# It does two jobs that both require this: it declares the ~20 entry points
+# GLdc does not have (glNewList, glTexGeni, glMultMatrixd, gluScaleImage...),
+# and it macro-redirects a short list of entry points GLdc *does* have so the
+# shim can observe them (texgen needs to see glDrawElements; the display list
+# recorder needs to see glBegin/glVertex3f). A TU that misses the -include
+# would still compile but would call GLdc directly and bypass the shim, which
+# is exactly the kind of half-applied state that is miserable to debug.
+# See the header's comment block for the full intercept list and kb/design-gl.md
+# for the measured API gap table.
 COMMON := $(KOS_CFLAGS) $(INCLUDES) -DHAVE_CONFIG_H -g $(HARNESS_DEFS) \
+          -include tr_glcompat.h \
           -fno-strict-aliasing -fno-omit-frame-pointer \
           -Wall -Wno-unused-variable -Wno-unused-but-set-variable \
           -Wno-unused-function -Wno-parentheses -Wno-format-truncation \
