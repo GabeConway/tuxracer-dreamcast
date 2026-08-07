@@ -57,6 +57,7 @@
 #undef glEnableClientState
 #undef glDisableClientState
 #undef glDrawElements
+#undef glAlphaFunc
 
 /* One-shot diagnostics. These fire on paths we believe are unreachable given
  * the call-site survey in kb/design-gl.md; if one ever prints, the survey was
@@ -69,6 +70,13 @@
             fprintf(stderr, "tr_glcompat: %s\n", (msg));             \
         }                                                            \
     } while (0)
+
+/* Largest texture edge the port will upload. See the budget note in
+ * tr_gluBuild2DMipmaps. -DTR_TEX_LIMIT=256 to try a sharper build; it will
+ * run out of VRAM in a race unless something else has been freed first. */
+#ifndef TR_TEX_LIMIT
+#define TR_TEX_LIMIT 128
+#endif
 
 int tr_gl_imm_hook = 0;
 
@@ -634,6 +642,12 @@ static void tr_update_imm_hook(void)
  */
 void tr_glEnable(GLenum cap)
 {
+#ifdef TR_TEXGEN_DISABLE
+    /* Bisection switch, not a feature: builds with texgen emulation off so a
+     * rendering artefact can be attributed to it or cleared of it in one run.
+     * The course terrain loses its texture entirely in such a build. */
+    if (cap == GL_TEXTURE_GEN_S || cap == GL_TEXTURE_GEN_T) return;
+#endif
     if (cap == GL_TEXTURE_GEN_S) { s_tg_s = GL_TRUE; tr_update_imm_hook(); return; }
     if (cap == GL_TEXTURE_GEN_T) { s_tg_t = GL_TRUE; tr_update_imm_hook(); return; }
     if (cap == GL_STENCIL_TEST) return;
@@ -674,6 +688,30 @@ void tr_glViewport(GLint x, GLint y, GLsizei w, GLsizei h)
     s_viewport[2] = (GLint) w;
     s_viewport[3] = (GLint) h;
     glViewport(x, y, w, h);
+}
+
+/*
+ * GLdc's glAlphaFunc validates against a list containing exactly one entry,
+ * GL_GREATER (GLdc a1cd80a8, GL/state.c), and throws GL_INVALID_ENUM for
+ * anything else. src/gl_util.c:185,204,343 asks for GL_GEQUAL, so on the stock
+ * path the cutoff was NEVER SET and every alpha-tested billboard -- the trees,
+ * the particles -- blended instead of punching through, sorting wrong against
+ * the terrain.
+ *
+ * It also cost 1,946 console lines in a single 240 s run (MEASURED), because
+ * src/gl_util.c checks glGetError() every frame and prints what it finds.
+ *
+ * GL_GEQUAL(x) and GL_GREATER(x) differ only for a fragment whose alpha is
+ * exactly the reference value. At ref 0.5 on 8-bit alpha that is one value out
+ * of 256, on assets that are almost entirely 0 or 255. Mapping one to the
+ * other is the whole fix.
+ */
+void tr_glAlphaFunc(GLenum func, GLclampf ref)
+{
+    if (func == GL_GEQUAL) {
+        func = GL_GREATER;
+    }
+    glAlphaFunc(func, ref);
 }
 
 void tr_glGetIntegerv(GLenum pname, GLint *params)
@@ -810,6 +848,83 @@ GLint tr_gluBuild2DMipmaps(GLenum target, GLint internalFormat,
      * with no chain behind it and samples garbage. The cost is aliasing when
      * minified.
      */
+    /*
+     * THE VRAM BUDGET.
+     *
+     * MEASURED over the 113 .rgb files the game ships, as 16 bpp PVR textures
+     * with mip chains: 13.03 MB with no limit, 4.15 MB with a 128 px limit.
+     * The Dreamcast has 8 MB of VRAM TOTAL, and the two framebuffers
+     * (1,228,800 B) and GLdc's PVR vertex buffer (655,360 B, GL/platforms/
+     * sh4.c:9) come out of the same 8 MB, leaving ~6.1 MB. A single race needs
+     * courses/common (5.60 MB) + textures/ (1.63 MB) + fonts (0.33 MB) + the
+     * course itself, so unlimited does not fit and it does not fail politely:
+     * the run reaches the racing view and then dies with "Ran out of memory,
+     * defragmenting" and a hard assert at GL/texture.c:164.
+     *
+     * The obvious lever is upstream's own: src/textures.c:130 asks for
+     * GL_MAX_TEXTURE_SIZE and squares anything larger down to it. DO NOT USE
+     * IT. src/textures.c:156 also rewrites texImage->sizeX/sizeY to the cap,
+     * and the UI lays itself out from those numbers -- reporting 128 renders
+     * the entire menu, and the splash logo, at half size. That was tried, and
+     * the screenshot is why this is here instead.
+     *
+     * Downscaling inside the upload is invisible to the game: texture
+     * coordinates are normalised, so nothing above this line can tell.
+     */
+    if (target == GL_TEXTURE_2D &&
+        (width > TR_TEX_LIMIT || height > TR_TEX_LIMIT) &&
+        type == GL_UNSIGNED_BYTE &&
+        (format == GL_RGB || format == GL_RGBA)) {
+        GLsizei nc = (format == GL_RGBA) ? 4 : 3;
+        GLsizei sw = width, sh = height;
+        const GLubyte *src = (const GLubyte *) data;
+        GLubyte *own = NULL;
+
+        while ((sw > TR_TEX_LIMIT || sh > TR_TEX_LIMIT) && sw > 1 && sh > 1) {
+            GLsizei dw = (sw > 1) ? sw / 2 : 1;
+            GLsizei dh = (sh > 1) ? sh / 2 : 1;
+            GLubyte *dst = (GLubyte *) malloc((size_t) dw * dh * nc);
+            GLsizei x, y, c;
+
+            if (dst == NULL) {
+                TR_WARN_ONCE("out of RAM downscaling a texture");
+                break;
+            }
+
+            /* 2x2 box filter. Point sampling would alias the tree and HUD
+             * artwork badly, and these are one-off loads, not a hot path. */
+            for (y = 0; y < dh; y++) {
+                for (x = 0; x < dw; x++) {
+                    for (c = 0; c < nc; c++) {
+                        const GLubyte *a = src + (((y * 2) * sw) + x * 2) * nc + c;
+                        const GLubyte *b = a + nc;
+                        const GLubyte *d = a + sw * nc;
+                        const GLubyte *e = d + nc;
+                        dst[(y * dw + x) * nc + c] =
+                            (GLubyte) (((unsigned) *a + *b + *d + *e) >> 2);
+                    }
+                }
+            }
+
+            free(own);
+            own = dst;
+            src = dst;
+            sw = dw;
+            sh = dh;
+        }
+
+        glTexImage2D(target, 0, internalFormat, sw, sh, 0, format, type, src);
+        if (sw == sh) {
+            glGenerateMipmap(GL_TEXTURE_2D);
+        }
+        else {
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        }
+        free(own);
+        return 0;
+    }
+
     if (target == GL_TEXTURE_2D) {
         glTexImage2D(target, 0, internalFormat, width, height, 0,
                      format, type, data);

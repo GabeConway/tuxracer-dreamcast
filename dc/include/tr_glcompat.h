@@ -278,6 +278,7 @@ void tr_glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pt
 void tr_glEnableClientState(GLenum cap);
 void tr_glDisableClientState(GLenum cap);
 void tr_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices);
+void tr_glAlphaFunc(GLenum func, GLclampf ref);
 
 #ifdef __cplusplus
 }
@@ -333,6 +334,11 @@ void tr_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *in
 #define glEnableClientState  tr_glEnableClientState
 #define glDisableClientState tr_glDisableClientState
 #define glDrawElements       tr_glDrawElements
+
+/* GLdc's glAlphaFunc accepts GL_GREATER and nothing else; the game asks for
+ * GL_GEQUAL. Without this the call is rejected, the cutoff is never set, and
+ * every alpha-tested billboard blends instead of punching through. */
+#define glAlphaFunc          tr_glAlphaFunc
 
 #endif /* !TR_GLCOMPAT_IMPL */
 

@@ -498,6 +498,31 @@ void winsys_process_events()
             update_pointer( dt );
             dispatch_keys( (int) cursor_x, (int) cursor_y );
 
+#ifdef TR_AUTOKEY
+            /*
+             * Unattended progress through the menus. The harness can read what
+             * the guest prints but cannot press anything, so without this the
+             * only screen that can ever be tested is the splash. Every
+             * TR_AUTOKEY frames, synthesise a press-and-release of Enter --
+             * which is what advances the splash, confirms a menu selection and
+             * starts a race -- so a build can walk itself to the racing view
+             * and dump a frame of it.
+             *
+             * Deliberately Enter and nothing else: a fixed key with a fixed
+             * period is reproducible, and anything cleverer would be a script
+             * that silently rots as the menus change.
+             */
+            {
+                static int autokey_n = 0;
+                if( keyboard_func != NULL && ++autokey_n % (TR_AUTOKEY) == 0 ) {
+                    (*keyboard_func)( 13, False, False,
+                                      (int) cursor_x, (int) cursor_y );
+                    (*keyboard_func)( 13, False, True,
+                                      (int) cursor_x, (int) cursor_y );
+                }
+            }
+#endif
+
             if ( redisplay && display_func ) {
                 redisplay = False;
                 (*display_func)();
