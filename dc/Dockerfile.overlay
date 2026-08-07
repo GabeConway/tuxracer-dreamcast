@@ -1,0 +1,37 @@
+# Fast path SDK image: tuxracer-dc:sdk built ON TOP of opencrossing-dc:sdk.
+#
+# The base already carries sh-elf-gcc 15.2.0, KallistiOS, GLdc (-lGL/-lGLU),
+# zlib and mkdcdisc, which took ~27 min to build. Everything Tux Racer needs
+# beyond that is two more kos-ports, and those take ~2 min. Building the
+# world again to add them would be pure waste.
+#
+#   bash dc/build-dc-image.sh            # picks this file when the base exists
+#
+# If you do not have opencrossing-dc:sdk, dc/Dockerfile is the standalone
+# recipe and produces an equivalent image from debian:bookworm.
+#
+# NOTE: this host has no BuildKit. Use the legacy builder:
+#   DOCKER_BUILDKIT=0 docker build ...
+# and do NOT pass --progress (unsupported, hard-fails).
+
+FROM opencrossing-dc:sdk
+
+ARG JOBS=4
+
+# libjimtcl — Jim Tcl. Tux Racer's data files (courses, tux.tcl, the init
+# script) are real Tcl: proc, regexp, catch, open/gets, while, expr, global,
+# source. A hand-rolled mini-interpreter would have to reimplement all of
+# that, so we take a real one. Jim is ~10x smaller than Tcl 8.x and needs no
+# POSIX beyond what KOS has. dc/src/tcl_compat.c maps the 35 Tcl_* entry
+# points the game calls onto Jim_*.
+#
+# libmodplug — the soundtrack is Impulse Tracker (.it) modules, which is what
+# this decodes. Without it the game is silent; SDL_mixer, which upstream used,
+# has no KOS port.
+RUN bash -c '. /opt/toolchains/dc/kos/environ.sh \
+      && make -C "$KOS_PORTS/libjimtcl"  install clean \
+      && make -C "$KOS_PORTS/libmodplug" install clean'
+
+WORKDIR /work
+ENTRYPOINT ["/usr/local/bin/dc-env"]
+CMD ["/bin/bash"]
