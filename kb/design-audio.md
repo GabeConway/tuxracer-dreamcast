@@ -133,3 +133,78 @@ poll thread cannot get in.
   (`src/audio.c:96`). `is_audio_open()` is the only caller and ignores the values.
 - **Not run on hardware or Flycast.** Every claim above is from source reading,
   header inspection and a syntax-check build. No `.cdi` has been booted.
+
+---
+
+# Silence, and how far it has been chased (2026-08-07)
+
+The port produces no audible sound. Two things are established and one is not.
+
+## Fixed: `Mix_LoadMUS` stored a relative path
+
+`Mix_LoadMUS` deliberately does not decode — it records the path and
+`Mix_PlayMusic` does the `ModPlug_Load`, because five decoded modules do not
+fit in 16 MB. The path it recorded was the caller's, and the caller's is
+relative: `data/tuxracer_init.tcl:31` passes `music/start1-jt.it`.
+
+Between the two calls the game changes directory — `src/course_load.c:345`
+and `src/file_util.c` walk in and out of course directories, and
+`tuxracer_init.tcl` has its own `tux_goto_data_dir`. By the time the splash
+screen asks for music, the working directory is elsewhere and the `fopen`
+misses.
+
+MEASURED, with `-DTR_AUDIO_TRACE`:
+
+```
+before:  PlayMusic 0x8c3d6b28 loops=-1
+         polls=98 cb=0 playing=0 stream=0 mpf=0x0     <- never started
+after:   LoadMUS resolved -> /cd/music/start1-jt.it
+         polls=98 cb=4 playing=1 stream=0 mpf=0x8c4956f8
+```
+
+`Mix_PlayMusic` returns -1 on that path and **the game has no error handler for
+it**, so this failed in complete silence and looked exactly like an AICA or a
+libmodplug problem. The path is now made absolute in `Mix_LoadMUS`.
+
+## Not fixed: the AICA does not drain the stream
+
+With the module loaded and the stream started, the callback runs **four times
+and then stops forever**:
+
+```
+dc_mixer: polls=98 cb=4 playing=1 stream=0 mpf=0x8c4956f8
+dc_mixer: polls=98 cb=4 playing=1 stream=0 mpf=0x8c4956f8   (unchanged, every 2 s)
+```
+
+`polls` is the music thread looping ~50 times a second and calling
+`snd_stream_poll`; `cb` counts entries to `mus_get_data`. Four callbacks is the
+prefill `snd_stream_start` performs. After that `snd_stream_poll` never asks
+for another byte, which means KOS believes the ring is still full, which means
+**the AICA's read pointer is not advancing**.
+
+So the guest is not producing samples — this is not a host playback problem,
+and there is no point looking at Flycast's audio backend until the read pointer
+moves.
+
+What is already ruled out:
+
+- `snd_stream_init_ex` / `snd_stream_alloc` / `snd_stream_start` all succeed
+  (`mus_stream` is a valid handle, no warning logged).
+- `mus_rate` is 22050 and `spec_channels` is 2 — not a zero-frequency channel.
+- `snd_init()` works: every effect uploads into AICA RAM successfully
+  (357,536 B used of 2 MB), which goes through the same driver.
+- The music thread is alive and holds/releases the lock correctly.
+
+## Next step
+
+Find out whether the AICA ARM core is executing KOS's driver at all under
+Flycast + reios. The cheap probe is a standalone KOS program in
+`harness/dc/` — no game, no shim, in the shape of `harness/dc/gltest/` — that
+calls `snd_stream_start` on a generated tone and prints the callback count once
+a second. If that also freezes at the prefill, the problem is KOS-vs-Flycast
+and not this file; if it streams correctly, the difference is something this
+mixer does, and the first suspect is the SFX voice reservation
+(`snd_sfx_chn_alloc`) colliding with the two voices the stream needs.
+
+Do not "fix" this by changing volumes or the resampling mode. Neither can move
+a read pointer.

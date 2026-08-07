@@ -42,6 +42,7 @@
 
 #include <stdarg.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <malloc.h>
@@ -61,6 +62,10 @@
 
 #include "SDL.h"
 #include "SDL_mixer.h"
+
+#ifdef TR_AUDIO_TRACE
+int mus_cb_count = 0;
+#endif
 
 /* Per-channel SPU ring buffer for the music stream. snd_stream_poll() asks the
  * callback for at most buffer_size bytes for a stereo stream
@@ -277,6 +282,10 @@ static void *mus_get_data(snd_stream_hnd_t hnd, int req_bytes, int *recv_bytes)
     if (mus_mpf != NULL && mus_buf != NULL)
         got = ModPlug_Read(mus_mpf, mus_buf, req_bytes);
 
+#ifdef TR_AUDIO_TRACE
+    mus_cb_count++;
+#endif
+
     if (got <= 0) {
         /* End of module (ModPlug_Read returns 0 at the end, and with
          * mLoopCount == -1 it never does). Returning NULL makes KOS fill the
@@ -300,8 +309,27 @@ static void *mus_thread_fn(void *param)
 
     while (mus_thread_run) {
         mutex_lock(&audio_lock);
-        if (mus_playing && mus_stream != SND_STREAM_INVALID)
+        if (mus_playing && mus_stream != SND_STREAM_INVALID) {
             snd_stream_poll(mus_stream);
+        }
+#ifdef TR_AUDIO_TRACE
+            /* Is the AICA actually consuming? If it is not, the ring never
+             * drains, snd_stream_poll stops asking mus_get_data for data, and
+             * cb freezes. That distinguishes "the guest produced no samples"
+             * from "the host did not play them" -- see kb/design-audio.md. */
+            {
+                static int polls = 0;
+                static uint64 t = 0;
+                uint64 now = timer_ms_gettime64();
+                polls++;
+                if(now - t >= 2000) {
+                    printf("dc_mixer: polls=%d cb=%d playing=%d stream=%d mpf=%p\n",
+                           polls, mus_cb_count, (int)mus_playing,
+                           (int)mus_stream, (void*)mus_mpf);
+                    t = now; polls = 0;
+                }
+            }
+#endif
         mutex_unlock(&audio_lock);
 
         thd_sleep(DC_MUS_POLL_MS);
@@ -563,6 +591,9 @@ void Mix_FreeChunk(Mix_Chunk *chunk)
 
 int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops)
 {
+#ifdef TR_AUDIO_TRACE
+    printf("dc_mixer: PlayChannel ch=%d chunk=%p loops=%d\n", channel, (void*)chunk, loops);
+#endif
     sfx_play_data_t d;
     int chn, reserved = 0;
 
@@ -706,6 +737,9 @@ int Mix_VolumeChunk(Mix_Chunk *chunk, int volume)
 
 Mix_Music *Mix_LoadMUS(const char *file)
 {
+#ifdef TR_AUDIO_TRACE
+    printf("dc_mixer: LoadMUS %s\n", file ? file : "(null)");
+#endif
     Mix_Music *music;
     FILE      *fp;
 
@@ -730,12 +764,47 @@ Mix_Music *Mix_LoadMUS(const char *file)
         return NULL;
     }
 
-    music->path = strdup(file);
+    /*
+     * The path is made ABSOLUTE here, and that is not tidiness -- it is the
+     * whole reason the lazy load works.
+     *
+     * Mix_LoadMUS defers the decode to Mix_PlayMusic (see the header comment:
+     * five decoded modules do not fit in 16 MB). But the caller's path is
+     * relative -- data/tuxracer_init.tcl:31 passes "music/start1-jt.it" -- and
+     * between the two calls the game chdir()s: src/course_load.c:345 and
+     * src/file_util.c walk in and out of course directories, and
+     * tuxracer_init.tcl has its own tux_goto_data_dir. By the time the splash
+     * screen asks for its music the working directory is somewhere else and
+     * fopen() misses.
+     *
+     * MEASURED: without this, Mix_PlayMusic returned -1 on the fopen for every
+     * track, silently -- the game has no error path for it -- and the port
+     * played no music at all while looking, from the outside, exactly like an
+     * AICA or a libmodplug problem.
+     */
+    if (file[0] == '/') {
+        music->path = strdup(file);
+    }
+    else {
+        char cwd[256];
+        if (getcwd(cwd, sizeof(cwd)) == NULL) {
+            cwd[0] = '\0';
+        }
+        music->path = (char *) malloc(strlen(cwd) + 1 + strlen(file) + 1);
+        if (music->path != NULL) {
+            sprintf(music->path, "%s/%s", cwd, file);
+        }
+    }
+
     if (music->path == NULL) {
         free(music);
         set_error("out of memory");
         return NULL;
     }
+
+#ifdef TR_AUDIO_TRACE
+    printf("dc_mixer: LoadMUS resolved -> %s\n", music->path);
+#endif
 
     return music;
 }
@@ -758,6 +827,9 @@ void Mix_FreeMusic(Mix_Music *music)
 
 int Mix_PlayMusic(Mix_Music *music, int loops)
 {
+#ifdef TR_AUDIO_TRACE
+    printf("dc_mixer: PlayMusic %p loops=%d\n", (void*)music, loops);
+#endif
     ModPlug_Settings settings;
     FILE   *fp;
     long    len;
@@ -775,6 +847,9 @@ int Mix_PlayMusic(Mix_Music *music, int loops)
     fp = fopen(music->path, "rb");
     if (fp == NULL) {
         set_error("cannot open music file %s", music->path);
+#ifdef TR_AUDIO_TRACE
+        printf("dc_mixer: PlayMusic FAILED to open %s\n", music->path);
+#endif
         return -1;
     }
     if (fseek(fp, 0, SEEK_END) != 0 || (len = ftell(fp)) <= 0) {
