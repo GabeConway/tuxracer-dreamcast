@@ -12,6 +12,7 @@ dc/build-perf/
 # Fetched upstream payloads (see tools/fetch-upstream.sh)
 upstream/tarballs/
 data/
+data-dc/
 
 # Editor / OS
 .DS_Store
