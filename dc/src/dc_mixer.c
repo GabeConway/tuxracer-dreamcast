@@ -55,31 +55,60 @@
 
 #include <dc/sound/sound.h>
 #include <dc/sound/sfxmgr.h>
-#include <dc/sound/stream.h>
 #include <dc/sound/aica_comm.h>
+#include <dc/spu.h>
 
 #include <modplug/modplug.h>
 
 #include "SDL.h"
 #include "SDL_mixer.h"
+#include "dc_aica.h"
+
+/* KOS's snd_effect_t, which snd_sfx_load() returns a pointer to as an opaque
+ * sfxhnd_t. It is declared in snd_sfxmgr.c, not in a header, because KOS only
+ * ever expects you to hand the handle back to snd_sfx_play(). We do not use
+ * snd_sfx_play() -- it queues to an ARM firmware that never runs (dc_aica.h) --
+ * so we need the fields: where the sample landed in sound RAM, how long it is,
+ * and in what format. Layout copied from
+ * kernel/arch/dreamcast/sound/snd_sfxmgr.c:32-41. */
+typedef struct dc_snd_effect {
+    uint32_t locl, locr;
+    uint32_t len;
+    uint32_t rate;
+    uint32_t used;
+    uint32_t fmt;
+    uint16_t stereo;
+} dc_snd_effect_t;
 
 #ifdef TR_AUDIO_TRACE
 int mus_cb_count = 0;
 #endif
 
-/* Per-channel SPU ring buffer for the music stream. snd_stream_poll() asks the
- * callback for at most buffer_size bytes for a stereo stream
- * (kos .../sound/snd_stream.c:697,845), so this also sizes the decode buffer.
- * 16 KB per channel = 32 KB of AICA RAM and ~186 ms of 22050 Hz stereo, which
- * is a comfortable margin over the 20 ms poll interval without being greedy
- * with a 2 MB pool. */
+/* Per-channel ring buffer for the music stream, in AICA sound RAM. Two voices
+ * loop over these forever and the music thread writes ahead of the play
+ * position. 16 KB per channel = 8192 16-bit samples = 371 ms at 22050 Hz: a
+ * wide margin over the 20 ms poll interval, for 32 KB of a 2 MB pool. */
 #define DC_MUS_BUFSIZE  (16 * 1024)
+#define DC_MUS_SAMPLES  (DC_MUS_BUFSIZE / 2)
 
-/* How often the music thread pumps the stream. Must be well under the time it
- * takes the AICA to drain DC_MUS_BUFSIZE. */
+/* How often the music thread refills. Must be well under the time it takes the
+ * AICA to drain the ring. */
 #define DC_MUS_POLL_MS  20
 
-#define DC_AICA_VOICES  64
+/* Do not refill for less than this many samples.
+ *
+ * MEASURED (playtest, racing view): 512 -> 9-11 fps, 2048 -> 4-8 fps. Batching
+ * does NOT pay here. The cost is libmodplug's decode, which is per-sample and
+ * therefore constant either way; what batching adds is a single long
+ * de-interleave-and-upload burst that lands inside one frame instead of being
+ * spread over several. Small and frequent is the right shape for a 33 ms
+ * budget. Do not raise this without a playtest fps number in hand. */
+#define DC_MUS_MIN_FILL 512
+
+/* Voices 0 and 1 are the music ring's left and right. Effects never get them. */
+#define DC_MUS_VOICE_L  0
+#define DC_MUS_VOICE_R  1
+#define DC_SFX_FIRST    2
 
 /* --------------------------------------------------------------------------
  * Shared state
@@ -127,12 +156,18 @@ struct _Mix_Music {
     char *path;         /* see divergence #1 at the top of this file */
 };
 
-static snd_stream_hnd_t   mus_stream  = SND_STREAM_INVALID;
 static ModPlugFile       *mus_mpf     = NULL;
 static Mix_Music         *mus_current = NULL;
-static uint8_t           *mus_buf     = NULL;
 static kthread_t         *mus_thread  = NULL;
 static int                mus_rate    = 22050;
+
+/* The music ring: two AICA-side buffers (left, right), the write cursor into
+ * them in samples, and the main-RAM staging buffers libmodplug decodes into
+ * before the de-interleave. */
+static uint32_t           mus_ring[2] = { 0, 0 };
+static int16_t           *mus_decode  = NULL;   /* interleaved, from ModPlug */
+static int16_t           *mus_split[2] = { NULL, NULL };
+static uint32_t           mus_write   = 0;
 static int                mus_volume  = MIX_MAX_VOLUME;
 static volatile int       mus_playing = 0;
 static volatile int       mus_thread_run = 0;
@@ -167,86 +202,80 @@ static int aica_volume(int chunk_vol)
     return v;
 }
 
-/* Change the level of a voice that is already sounding. sfxmgr has no call for
- * this, but the AICA firmware does: AICA_CH_CMD_UPDATE with the SET_VOL bit.
- * This is the same mechanism snd_stream_volume() uses. */
-static void aica_set_chan_volume(int chn, int vol)
-{
-    AICA_CMDSTR_CHANNEL(tmp, cmd, chan);
-
-    cmd->cmd       = AICA_CMD_CHAN;
-    cmd->timestamp = 0;
-    cmd->size      = AICA_CMDSTR_CHANNEL_SIZE;
-    cmd->cmd_id    = chn;
-    chan->cmd      = AICA_CH_CMD_UPDATE | AICA_CH_UPDATE_SET_VOL;
-    chan->vol      = vol;
-
-    snd_sh4_to_aica(tmp, cmd->size);
-}
-
 /* Stop and free the whole voice group `chn` belongs to (see chan_group).
  * Caller holds audio_lock. */
 static void release_channel(int chn)
 {
     int primary, v;
 
-    if (chn < 0 || chn >= DC_AICA_VOICES)
+    if (chn < DC_SFX_FIRST || chn >= DC_AICA_VOICES)
         return;
 
     primary = chan_group[chn];
     if (primary < 0) {
         /* Not one of ours -- stop it anyway, that is what Mix_HaltChannel
          * promises, but there is nothing to unbook. */
-        snd_sfx_stop(chn);
+        dc_aica_stop(chn);
         return;
     }
 
-    for (v = 0; v < DC_AICA_VOICES; v++) {
+    for (v = DC_SFX_FIRST; v < DC_AICA_VOICES; v++) {
         if (chan_group[v] != primary)
             continue;
 
-        snd_sfx_stop(v);
-        if (chan_reserved[v]) {
-            snd_sfx_chn_free(v);
-            chan_reserved[v] = 0;
-        }
-        chan_owner[v] = NULL;
-        chan_group[v] = -1;
+        dc_aica_stop(v);
+        chan_owner[v]    = NULL;
+        chan_group[v]    = -1;
+        chan_reserved[v] = 0;
     }
 }
 
-/* Reserve two ADJACENT voices, so a stereo looping effect keeps both halves.
- * snd_sfx_chn_alloc() always returns the lowest free voice (snd_sfxmgr.c:837),
- * so two calls in a row are usually adjacent; when a hole makes them not, keep
- * the higher one and try again. Bounded, and everything is freed on failure.
- * Returns the primary voice, or -1. Caller holds audio_lock. */
-static int alloc_voice_pair(void)
+/* Find `n` adjacent free effect voices and return the first, or -1.
+ *
+ * "Free" means: not one of the music pair, not reserved by a looping effect,
+ * and not currently booked by a one-shot we started. One-shots are recycled
+ * round-robin (there is no completion interrupt to tell us when a sample ends,
+ * and polling 64 positions per frame would cost more than it saves), but
+ * reserved voices are never handed out -- so a burst of fish-pickup sounds can
+ * no longer steal the terrain loop out from under src/racing.c. */
+static int alloc_voices(int n, int allow_steal)
 {
-    int held[DC_AICA_VOICES];
-    int n = 0, i, prev = -1, primary = -1;
+    static int next = DC_SFX_FIRST;
+    int pass, i, v, k, ok;
 
-    while (n < DC_AICA_VOICES) {
-        int c = snd_sfx_chn_alloc();
-        if (c < 0)
-            break;
+    for (pass = 0; pass < 2; pass++) {
+        for (i = 0; i < DC_AICA_VOICES - DC_SFX_FIRST; i++) {
+            v = DC_SFX_FIRST +
+                ((next - DC_SFX_FIRST + i) % (DC_AICA_VOICES - DC_SFX_FIRST));
 
-        held[n++] = c;
+            if (v + n > DC_AICA_VOICES)
+                continue;
 
-        if (prev >= 0 && c == prev + 1) {
-            primary = prev;
-            break;
+            ok = 1;
+            for (k = 0; k < n; k++) {
+                if (chan_reserved[v + k])
+                    ok = 0;
+                /* First pass: only genuinely idle voices. Second pass: allow
+                 * recycling a sounding one-shot, which is what SDL_mixer does
+                 * when it runs out of channels. */
+                if (pass == 0 && chan_owner[v + k] != NULL)
+                    ok = 0;
+            }
+
+            if (!ok)
+                continue;
+
+            next = v + n;
+            if (next >= DC_AICA_VOICES)
+                next = DC_SFX_FIRST;
+            return v;
         }
-        prev = c;
+
+        if (!allow_steal)
+            break;
     }
 
-    /* Give back everything that is not the chosen pair. */
-    for (i = 0; i < n; i++) {
-        if (primary >= 0 && (held[i] == primary || held[i] == primary + 1))
-            continue;
-        snd_sfx_chn_free(held[i]);
-    }
-
-    return primary;
+    return -1;
 }
 
 /* libmodplug decodes internally at 44100 and downmixes to whatever you ask
@@ -264,43 +293,98 @@ static int clamp_mus_rate(int hz)
  * Music thread
  * -------------------------------------------------------------------------- */
 
-/* Runs on mus_thread with audio_lock held (the thread takes it around
- * snd_stream_poll), so it needs no locking of its own.
- *
- * KOS names these parameters "samples", but snd_stream_fill() passes and reads
- * BYTES (kos .../sound/snd_stream.c:717 -- get_data(hnd, needed_bytes, &got_bytes)).
- * Getting this wrong gives you a stream that plays at a quarter speed. */
-static void *mus_get_data(snd_stream_hnd_t hnd, int req_bytes, int *recv_bytes)
+/* Write `frames` decoded stereo frames from mus_decode into the ring at
+ * mus_write, splitting them into the two AICA-side buffers and wrapping. The
+ * AICA plays 16-bit mono per voice, so stereo is two voices reading two
+ * de-interleaved buffers -- exactly what KOS's snd_pcm_split does for its own
+ * stream, done here in C because the amounts are small and this runs on a
+ * background thread. Caller holds audio_lock. */
+static void ring_write(int frames)
 {
-    int got = 0;
+    int chunk, done = 0;
 
-    (void)hnd;
+    while (done < frames) {
+        int first = frames - done;
+        int i;
 
-    if (req_bytes > DC_MUS_BUFSIZE)
-        req_bytes = DC_MUS_BUFSIZE;
+        if (mus_write + (uint32_t)first > DC_MUS_SAMPLES)
+            first = (int)(DC_MUS_SAMPLES - mus_write);
 
-    if (mus_mpf != NULL && mus_buf != NULL)
-        got = ModPlug_Read(mus_mpf, mus_buf, req_bytes);
+        for (i = 0; i < first; i++) {
+            mus_split[0][i] = mus_decode[(done + i) * 2 + 0];
+            mus_split[1][i] = mus_decode[(done + i) * 2 + 1];
+        }
+
+        spu_memload(mus_ring[0] + mus_write * 2, mus_split[0], first * 2);
+        spu_memload(mus_ring[1] + mus_write * 2, mus_split[1], first * 2);
+
+        mus_write += (uint32_t)first;
+        if (mus_write >= DC_MUS_SAMPLES)
+            mus_write = 0;
+
+        done += first;
+        chunk = first;
+        if (chunk == 0)
+            break;      /* defensive: never spin if the ring maths goes wrong */
+    }
+}
+
+/* Fill silence rather than leaving the tail of a finished module looping
+ * forever. Caller holds audio_lock. */
+static void ring_silence(int frames)
+{
+    int i;
+
+    for (i = 0; i < frames * 2; i++)
+        mus_decode[i] = 0;
+
+    ring_write(frames);
+}
+
+/* One refill pass: how far has the AICA got, and how much can we write without
+ * overtaking it? Caller holds audio_lock. */
+static void mus_pump(void)
+{
+    uint32_t pos, space;
+    int      want, got, frames;
+
+    if (!mus_playing || mus_mpf == NULL)
+        return;
+
+    /* The voice's own position register is the only feedback there is. Keeping
+     * one sample of gap means "full" and "empty" never look alike. */
+    pos = dc_aica_pos(DC_MUS_VOICE_L);
+    if (pos >= DC_MUS_SAMPLES)
+        pos = 0;
+
+    space = (pos + DC_MUS_SAMPLES - mus_write - 1) % DC_MUS_SAMPLES;
+
+    if (space < DC_MUS_MIN_FILL)
+        return;
+
+    want = (int)space;
+    if (want > DC_MUS_SAMPLES / 2)
+        want = DC_MUS_SAMPLES / 2;    /* bounded work per pass */
+
+    got = ModPlug_Read(mus_mpf, mus_decode, want * 4);   /* stereo, 16-bit */
 
 #ifdef TR_AUDIO_TRACE
     mus_cb_count++;
 #endif
 
     if (got <= 0) {
-        /* End of module (ModPlug_Read returns 0 at the end, and with
-         * mLoopCount == -1 it never does). Returning NULL makes KOS fill the
-         * ring with silence and snd_stream_poll() return 0 -- no glitch, and
-         * update_audio() (src/audio.c:667) sees Mix_PlayingMusic() go false on
-         * the next frame and clears its own bookkeeping. */
+        /* End of module. With mLoopCount == -1 this never happens; when it
+         * does, hand the ring silence and let update_audio()
+         * (src/audio.c:667) see Mix_PlayingMusic() go false next frame. */
+        ring_silence((int)space > DC_MUS_SAMPLES / 2
+                     ? DC_MUS_SAMPLES / 2 : (int)space);
         mus_playing = 0;
-        *recv_bytes = 0;
-        return NULL;
+        return;
     }
 
-    /* A short read is fine: KOS advances its write position by exactly what we
-     * hand back (snd_stream.c:737-784). */
-    *recv_bytes = got;
-    return mus_buf;
+    frames = got / 4;
+    if (frames > 0)
+        ring_write(frames);
 }
 
 static void *mus_thread_fn(void *param)
@@ -309,26 +393,21 @@ static void *mus_thread_fn(void *param)
 
     while (mus_thread_run) {
         mutex_lock(&audio_lock);
-        if (mus_playing && mus_stream != SND_STREAM_INVALID) {
-            snd_stream_poll(mus_stream);
-        }
+        mus_pump();
 #ifdef TR_AUDIO_TRACE
-            /* Is the AICA actually consuming? If it is not, the ring never
-             * drains, snd_stream_poll stops asking mus_get_data for data, and
-             * cb freezes. That distinguishes "the guest produced no samples"
-             * from "the host did not play them" -- see kb/design-audio.md. */
-            {
-                static int polls = 0;
-                static uint64 t = 0;
-                uint64 now = timer_ms_gettime64();
-                polls++;
-                if(now - t >= 2000) {
-                    printf("dc_mixer: polls=%d cb=%d playing=%d stream=%d mpf=%p\n",
-                           polls, mus_cb_count, (int)mus_playing,
-                           (int)mus_stream, (void*)mus_mpf);
-                    t = now; polls = 0;
-                }
+        {
+            static int polls = 0;
+            static uint64 t = 0;
+            uint64 now = timer_ms_gettime64();
+            polls++;
+            if(now - t >= 2000) {
+                printf("dc_mixer: polls=%d reads=%d playing=%d pos=%lu write=%lu\n",
+                       polls, mus_cb_count, (int)mus_playing,
+                       (unsigned long)dc_aica_pos(DC_MUS_VOICE_L),
+                       (unsigned long)mus_write);
+                t = now; polls = 0;
             }
+        }
 #endif
         mutex_unlock(&audio_lock);
 
@@ -341,8 +420,8 @@ static void *mus_thread_fn(void *param)
 /* Caller holds audio_lock. */
 static void stop_music_locked(void)
 {
-    if (mus_stream != SND_STREAM_INVALID && (mus_playing || mus_mpf != NULL))
-        snd_stream_stop(mus_stream);
+    dc_aica_stop(DC_MUS_VOICE_L);
+    dc_aica_stop(DC_MUS_VOICE_R);
 
     mus_playing = 0;
 
@@ -403,36 +482,35 @@ int Mix_OpenAudio(int frequency, Uint16 format, int channels, int chunksize)
     if (audio_open)
         return 0;
 
-    /* snd_stream_init_ex() implicitly calls snd_init(), which is what sfxmgr
-     * needs too, so this one call brings up both halves. The _ex form lets us
-     * cap the stereo split buffer it allocates in MAIN RAM: the default is
-     * SND_STREAM_BUFFER_MAX (64 KB) per channel = 128 KB, and we only ever
-     * need DC_MUS_BUFSIZE. */
-    if (snd_stream_init_ex(2, DC_MUS_BUFSIZE) < 0) {
-        set_error("snd_stream_init_ex failed");
-        return -1;
-    }
+    /* Brings up the SPU and KOS's sound-RAM allocator. No KOS stream and no
+     * sfxmgr playback: both of those route through an ARM firmware that does
+     * not run here (dc/include/dc_aica.h). Loading and allocation still use
+     * KOS -- that part is SH-4 code. */
+    dc_aica_init();
 
     spec_channels = (channels >= 2) ? 2 : 1;
-    /* The AICA stream path is 16-bit PCM. If the game asked for AUDIO_U8 we
-     * still report the truth here rather than echoing the request back. */
+    /* The AICA path is 16-bit PCM. If the game asked for AUDIO_U8 we still
+     * report the truth here rather than echoing the request back. */
     spec_format = AUDIO_S16SYS;
     (void)format;
     mus_rate  = clamp_mus_rate(frequency > 0 ? frequency : 22050);
     spec_freq = mus_rate;
 
-    mus_buf = memalign(32, DC_MUS_BUFSIZE);
-    if (mus_buf == NULL) {
-        set_error("out of memory allocating %d byte music buffer", DC_MUS_BUFSIZE);
-        snd_stream_shutdown();
-        return -1;
-    }
+    /* The music ring lives in sound RAM; the decode and split buffers in main
+     * RAM. If any of it fails, effects still work and only music is lost --
+     * say so and carry on rather than failing the whole device. */
+    mus_ring[0] = snd_mem_malloc(DC_MUS_BUFSIZE);
+    mus_ring[1] = snd_mem_malloc(DC_MUS_BUFSIZE);
+    mus_decode  = memalign(32, (DC_MUS_SAMPLES / 2) * 4);
+    mus_split[0] = memalign(32, DC_MUS_BUFSIZE);
+    mus_split[1] = memalign(32, DC_MUS_BUFSIZE);
 
-    mus_stream = snd_stream_alloc(mus_get_data, DC_MUS_BUFSIZE);
-    if (mus_stream == SND_STREAM_INVALID) {
-        /* Effects still work without this; only music is lost. Say so and
-         * carry on rather than failing the whole device. */
-        dbglog(DBG_WARNING, "dc_mixer: snd_stream_alloc failed, music disabled\n");
+    if (mus_ring[0] == 0 || mus_ring[1] == 0 || mus_decode == NULL ||
+        mus_split[0] == NULL || mus_split[1] == NULL) {
+        dbglog(DBG_WARNING, "dc_mixer: no music ring (%lu B AICA free), "
+               "music disabled\n", (unsigned long)snd_mem_available());
+        if (mus_ring[0] != 0) { snd_mem_free(mus_ring[0]); mus_ring[0] = 0; }
+        if (mus_ring[1] != 0) { snd_mem_free(mus_ring[1]); mus_ring[1] = 0; }
     }
 
     memset(chan_owner, 0, sizeof(chan_owner));
@@ -477,19 +555,20 @@ void Mix_CloseAudio(void)
 
     mutex_lock(&audio_lock);
 
-    snd_sfx_stop_all();
+    dc_aica_stop_all();
     memset(chan_owner, 0, sizeof(chan_owner));
     memset(chan_reserved, 0, sizeof(chan_reserved));
     memset(chan_group, -1, sizeof(chan_group));
 
-    if (mus_stream != SND_STREAM_INVALID) {
-        snd_stream_destroy(mus_stream);
-        mus_stream = SND_STREAM_INVALID;
-    }
-    snd_stream_shutdown();
+    if (mus_ring[0] != 0) { snd_mem_free(mus_ring[0]); mus_ring[0] = 0; }
+    if (mus_ring[1] != 0) { snd_mem_free(mus_ring[1]); mus_ring[1] = 0; }
 
-    free(mus_buf);
-    mus_buf = NULL;
+    free(mus_decode);
+    free(mus_split[0]);
+    free(mus_split[1]);
+    mus_decode = NULL;
+    mus_split[0] = NULL;
+    mus_split[1] = NULL;
 
     mutex_unlock(&audio_lock);
 }
@@ -578,7 +657,7 @@ void Mix_FreeChunk(Mix_Chunk *chunk)
     /* Upstream frees chunks from delete_unused_audio_data()
      * (src/audio_data.c:477) without first halting them; a voice still reading
      * the sample out of freed AICA RAM would scream. */
-    for (i = 0; i < DC_AICA_VOICES; i++) {
+    for (i = DC_SFX_FIRST; i < DC_AICA_VOICES; i++) {
         if (chan_owner[i] == chunk)
             release_channel(i);
     }
@@ -594,60 +673,70 @@ int Mix_PlayChannel(int channel, Mix_Chunk *chunk, int loops)
 #ifdef TR_AUDIO_TRACE
     printf("dc_mixer: PlayChannel ch=%d chunk=%p loops=%d\n", channel, (void*)chunk, loops);
 #endif
-    sfx_play_data_t d;
-    int chn, reserved = 0;
+    const dc_snd_effect_t *e;
+    uint32_t nsamp;
+    uint64_t keymask;
+    int chn, voices, vol, loop, v;
 
-    if (!audio_open || chunk == NULL)
+    if (!audio_open || chunk == NULL || chunk->hnd == SFXHND_INVALID)
         return -1;
+
+    e = (const dc_snd_effect_t *)chunk->hnd;
 
     mutex_lock(&audio_lock);
 
-    if (loops != 0 && channel < 0) {
-        /* Divergence #3, see the file header: keep looping effects out of the
-         * round-robin so one-shots cannot steal their voice. A pair, because
-         * every effect in data/sounds is stereo and therefore burns two. */
-        chn = alloc_voice_pair();
-        if (chn >= 0) {
-            channel = chn;
-            reserved = 1;
-        }
+    /* A stereo effect is two voices reading two de-interleaved copies, and
+     * every WAV in data/sounds is stereo. They must be adjacent so that the
+     * pair can be booked, volume-tracked and released as one group. */
+    voices = e->stereo ? 2 : 1;
+    loop   = (loops != 0);          /* divergence #2: boolean, not a count */
+
+    if (channel >= DC_SFX_FIRST && channel + voices <= DC_AICA_VOICES) {
+        release_channel(channel);
+        chn = channel;
+    } else {
+        chn = alloc_voices(voices, 1);
     }
 
-    if (channel >= 0 && channel < DC_AICA_VOICES && chan_group[channel] >= 0)
-        release_channel(channel);
-
-    memset(&d, 0, sizeof(d));
-    d.chn  = channel;               /* -1 lets KOS pick */
-    d.idx  = chunk->hnd;
-    d.vol  = aica_volume(chunk->volume);
-    d.pan  = 128;                   /* centre; Tux Racer never pans */
-    d.loop = (loops != 0);          /* divergence #2: boolean, not a count */
-    d.freq = 0;                     /* 0 => the sample's own rate */
-
-    chn = snd_sfx_play_ex(&d);
-
     if (chn < 0) {
-        if (reserved)
-            snd_sfx_chn_free(channel);
         mutex_unlock(&audio_lock);
         set_error("no free AICA voice");
         return -1;
     }
 
-    if (chn < DC_AICA_VOICES) {
-        chan_owner[chn]    = chunk;
-        chan_group[chn]    = (signed char)chn;
-        chan_reserved[chn] = (unsigned char)reserved;
+    for (v = 0; v < voices; v++)
+        release_channel(chn + v);
 
-        /* Only reserved (looping) plays book the second voice. A one-shot on a
-         * round-robin voice cannot claim chn+1 -- KOS may already have handed
-         * that to someone else -- and one-shots are not volume-modulated, so
-         * the missing bookkeeping costs nothing. */
-        if (reserved && chn + 1 < DC_AICA_VOICES) {
-            chan_owner[chn + 1]    = chunk;
-            chan_group[chn + 1]    = (signed char)chn;
-            chan_reserved[chn + 1] = 1;
-        }
+    nsamp = e->len;
+    if (nsamp > DC_AICA_MAX_SAMPLES)
+        nsamp = DC_AICA_MAX_SAMPLES;    /* see kb/design-audio.md: three of the
+                                         * shipped effects are longer than the
+                                         * hardware can address. */
+
+    vol = aica_volume(chunk->volume);
+    keymask = 0;
+
+    /* Program both halves before keying either on, or the left channel starts
+     * ahead of the right and the effect arrives smeared. */
+    dc_aica_play_delayed(chn, e->locl, (int)e->fmt, nsamp, loop, e->rate,
+                         vol, e->stereo ? 0 : 128);
+    keymask |= 1ULL << chn;
+
+    if (e->stereo) {
+        dc_aica_play_delayed(chn + 1, e->locr, (int)e->fmt, nsamp, loop,
+                             e->rate, vol, 255);
+        keymask |= 1ULL << (chn + 1);
+    }
+
+    dc_aica_key_on(keymask);
+
+    for (v = 0; v < voices; v++) {
+        chan_owner[chn + v]    = chunk;
+        chan_group[chn + v]    = (signed char)chn;
+        /* Divergence #3, see the file header: a looping effect holds its
+         * voices until something halts it, so the one-shot round-robin can
+         * never steal the terrain loop out from under src/racing.c. */
+        chan_reserved[chn + v] = (unsigned char)loop;
     }
 
     mutex_unlock(&audio_lock);
@@ -664,7 +753,7 @@ int Mix_HaltChannel(int channel)
     mutex_lock(&audio_lock);
 
     if (channel < 0) {
-        for (i = 0; i < DC_AICA_VOICES; i++)
+        for (i = DC_SFX_FIRST; i < DC_AICA_VOICES; i++)
             release_channel(i);
     } else if (channel < DC_AICA_VOICES) {
         release_channel(channel);
@@ -693,9 +782,9 @@ int Mix_Volume(int channel, int volume)
             volume = MIX_MAX_VOLUME;
         sfx_master_volume = volume;
 
-        for (i = 0; i < DC_AICA_VOICES; i++) {
+        for (i = DC_SFX_FIRST; i < DC_AICA_VOICES; i++) {
             if (chan_owner[i] != NULL)
-                aica_set_chan_volume(i, aica_volume(chan_owner[i]->volume));
+                dc_aica_set_vol(i, aica_volume(chan_owner[i]->volume));
         }
     }
 
@@ -721,9 +810,9 @@ int Mix_VolumeChunk(Mix_Chunk *chunk, int volume)
 
         /* Must reach voices that are already sounding: src/racing.c:334-361
          * modulates the terrain loops with set_sound_volume() every frame. */
-        for (i = 0; i < DC_AICA_VOICES; i++) {
+        for (i = DC_SFX_FIRST; i < DC_AICA_VOICES; i++) {
             if (chan_owner[i] == chunk)
-                aica_set_chan_volume(i, aica_volume(volume));
+                dc_aica_set_vol(i, aica_volume(volume));
         }
     }
 
@@ -839,8 +928,8 @@ int Mix_PlayMusic(Mix_Music *music, int loops)
     if (!audio_open || music == NULL)
         return -1;
 
-    if (mus_stream == SND_STREAM_INVALID) {
-        set_error("no music stream available");
+    if (mus_ring[0] == 0 || mus_ring[1] == 0) {
+        set_error("no music ring available");
         return -1;
     }
 
@@ -904,11 +993,28 @@ int Mix_PlayMusic(Mix_Music *music, int loops)
         return -1;
     }
 
-    snd_stream_start(mus_stream, (uint32_t)mus_rate, spec_channels == 2);
-    snd_stream_volume(mus_stream, (mus_volume * 255) / MIX_MAX_VOLUME);
+    /* Start from a silent ring so the first refill cannot be heard chasing the
+     * play head, then prime it before either voice is keyed on. */
+    spu_memset(mus_ring[0], 0, DC_MUS_BUFSIZE);
+    spu_memset(mus_ring[1], 0, DC_MUS_BUFSIZE);
+    mus_write = 0;
+
+    mus_playing = 1;
+    mus_pump();                 /* fills up to half the ring */
+
+    {
+        int vol = (mus_volume * 255) / MIX_MAX_VOLUME;
+
+        dc_aica_play_delayed(DC_MUS_VOICE_L, mus_ring[0], DC_AICA_FMT_16BIT,
+                             DC_MUS_SAMPLES, 1, (uint32_t)mus_rate, vol, 0);
+        dc_aica_play_delayed(DC_MUS_VOICE_R, mus_ring[1], DC_AICA_FMT_16BIT,
+                             DC_MUS_SAMPLES, 1, (uint32_t)mus_rate, vol, 255);
+        /* Both voices in the same instant: a ring played by two voices that
+         * started a few samples apart never comes back into phase. */
+        dc_aica_key_on((1ULL << DC_MUS_VOICE_L) | (1ULL << DC_MUS_VOICE_R));
+    }
 
     mus_current = music;
-    mus_playing = 1;
 
     mutex_unlock(&audio_lock);
     return 0;
@@ -946,8 +1052,8 @@ int Mix_VolumeMusic(int volume)
             volume = MIX_MAX_VOLUME;
         mus_volume = volume;
 
-        if (mus_stream != SND_STREAM_INVALID)
-            snd_stream_volume(mus_stream, (mus_volume * 255) / MIX_MAX_VOLUME);
+        dc_aica_set_vol(DC_MUS_VOICE_L, (mus_volume * 255) / MIX_MAX_VOLUME);
+        dc_aica_set_vol(DC_MUS_VOICE_R, (mus_volume * 255) / MIX_MAX_VOLUME);
     }
 
     mutex_unlock(&audio_lock);

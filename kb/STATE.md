@@ -18,7 +18,7 @@ roadmap. If something is not listed as verified here, assume it is not.
 | **It links** | `tuxracer.elf`: **1,011 KB text, 17 KB data, 2,332 KB bss**. Comfortable inside 16 MB. |
 | **It boots** | KOS banner, maple enumerates the controller, `vid_set_mode: 640x480IL NTSC`, GLdc reports `1.1-698-ga1cd`. |
 | **Tcl init completes** | All five courses, the event/cup tree, every texture and sound declaration. The Jim list-parser patch was required for this (`kb/traps.md`). |
-| **Audio loads** | All seven effects into AICA RAM: 357,536 B used, 1,510,240 B free. |
+| **Audio plays** | Music streams and effects fire through a full race. The AICA is driven from the SH-4 (`dc/src/dc_aica.c`); KOS's ARM firmware never runs under Flycast — `kb/design-audio.md`. Seven effects in AICA RAM: 357,536 B used, 1,510,240 B free. |
 | **The render loop runs** | **59 fps, vsync-locked**, sustained over 33 s. Zero GL errors. |
 | Framebuffer capture | `tools/fbdump.sh` produces a real PNG of the guest screen. |
 
@@ -32,13 +32,18 @@ roadmap. If something is not listed as verified here, assume it is not.
   labelled workaround (`TR_FBDUMP_FRAME ?= 999999`) so the default build
   plays. **Top open issue** — full evidence and the next step in
   `kb/design-perf.md`.
-- **Racing runs at 12–15 fps**, 66–85 ms against a 33.3 ms budget. Menus are
-  vsync-locked at 59. Levers are ranked in `kb/design-perf.md`; none applied.
+- **Racing runs at 9–11 fps** with music playing (was 12–15 before audio
+  worked; libmodplug decodes 22050 Hz stereo on the SH-4 alongside the game).
+  Menus are vsync-locked at 59. Levers are ranked in `kb/design-perf.md`; none
+  applied. The audio-specific levers are in `kb/design-audio.md` §3.
 - **Settings do not persist.** KOS's ramdisk has no `mkdir`
   (`fs_ramdisk.c:778`) and the VMU filesystem is flat, so
   `<home>/.tuxracer/options` cannot exist. Needs a VMU save layer.
-- **Track marks render as a rainbow smear** on the snow behind Tux. Not
-  diagnosed. Trees and terrain are correct.
+- **Rainbow texture corruption** on the track marks behind Tux, on the fish,
+  and on the course path. Reported from a real playthrough 2026-08-07, so it is
+  wider than the "track marks only" this file used to claim. Not diagnosed;
+  trees and terrain are correct, which points at a format/conversion path used
+  by some textures and not others.
 - **Texgen emulation degrades tree billboards.** With `-DTR_TEXGEN_DISABLE`
   the trees render clean green and the terrain loses its texture, which is the
   trade the switch exists to expose. Not resolved.

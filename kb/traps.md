@@ -175,3 +175,27 @@ functions under the comment "Non Operational Stubs for portability"
 (`glAlphaFunc`, `glStencilFunc`, `glStencilOp`, `glGetTexParameteriv`,
 `glColorMask`, `glPixelStorei`, ...). They link and silently do nothing, which
 is worse than absent. See `kb/design-gl.md` §5.
+
+## Flycast's ARM7 ignores `msr CPSR_c` — all KOS audio is silent
+
+**Symptom.** Every sound is silent. `snd_sfx_play` returns a channel, the music
+stream's callback runs exactly four times (the prefill) and never again, and
+`snd_stream_poll` stops asking for data. Nothing logs an error.
+
+**Cause.** KOS's ARM sound firmware enables its timer FIQ with the byte-field
+form `msr CPSR_c, r0` (`sound/arm/crt0.s`, `arm_fiq_enable`). Flycast's ARM7
+ignores that instruction — the CPSR reads back unchanged, F still set — so the
+timer FIQ is never taken, `AICA_MEM_CLOCK` never advances, and `arm_main()`
+hangs on its first `timer_wait(10)`. The SH-4 → AICA command queue is then
+never drained: every `Mix_*` call goes to a processor that will not read it.
+`msr CPSR, r0` (full field) works; the difference is measurable in 500 ms.
+
+**The check.** `harness/dc/audiotest/build.sh && harness/dc/console.sh
+dc/build/audiotest.elf`. It asserts `arm_core_executes`,
+`arm_fiq_delivered`, `arm_clock_advances` and `aica_channel_plays`
+independently, so it tells you *which* of those broke rather than "no sound".
+
+**What this project does about it.** Nothing, in the firmware — patching it in
+SPU RAM was tried and did not take (evidence in `kb/design-audio.md`). The AICA
+is driven straight from the SH-4 instead (`dc/src/dc_aica.c`), which is also
+what makes effects work; they were dead for the same reason.
