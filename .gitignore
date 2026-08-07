@@ -1,0 +1,18 @@
+# Build output
+dc/build/
+dc/build-perf/
+*.o
+*.d
+*.elf
+*.bin
+*.cdi
+*.gdi
+*.iso
+
+# Fetched upstream payloads (see tools/fetch-upstream.sh)
+upstream/tarballs/
+data/
+
+# Editor / OS
+.DS_Store
+*.swp

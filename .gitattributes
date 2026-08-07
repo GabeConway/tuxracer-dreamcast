@@ -1,0 +1,5 @@
+* text=auto eol=lf
+*.rgb  binary
+*.wav  binary
+*.it   binary
+*.png  binary
