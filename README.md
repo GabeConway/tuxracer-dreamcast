@@ -16,23 +16,32 @@ boundary, not in the game.
    ───────────────────────          ─────────
    desktop OpenGL 1.2 + GLU    ->   GLdc on the PowerVR2  (+ a compat shim)
    SDL 1.2 video / events      ->   KallistiOS maple + PVR
-   SDL_mixer                   ->   KOS snd_sfx + libmodplug
+   SDL_mixer                   ->   AICA voices driven from the SH-4 + libmodplug
    Tcl 8.x                     ->   Jim Tcl
    X11 / Win32 filesystem      ->   KOS iso9660 at /cd
 ```
 
 ## Status
 
-**It plays.** The splash screen, the menus and race-select all render
-correctly, a course loads, and Tux races down it with terrain, trees, fog, the
-HUD and sound — 52 s of continuous racing captured at 13–15 fps, with zero GL
-errors.
+**It plays, with sound.** Splash, menus and race-select render correctly, a
+course loads, and Tux races down it with terrain, trees, fog and the HUD, while
+music streams and the effects fire.
 
-It is not finished. Racing is 66–85 ms/frame against a 33.3 ms budget, course
-loading stalls in some builds in a way that looks like a latent memory bug, and
-settings cannot persist because KOS's ramdisk has no `mkdir`.
-[`kb/STATE.md`](kb/STATE.md) is the honest list, updated with every change that
-affects it; this section is not a roadmap.
+What is still wrong, in the order it is felt:
+
+- **Racing is 9–11 fps** (90–110 ms against a 33.3 ms budget). Menus are
+  vsync-locked at 59.
+- **Rainbow texture corruption** on the track marks, the fish and the course
+  path. Trees and terrain are correct, so it is a format/conversion path used
+  by some textures and not others. Not diagnosed.
+- **Settings do not persist** — KOS's ramdisk has no `mkdir` and the VMU
+  filesystem is flat, so `~/.tuxracer/options` cannot exist.
+- **Course loading stalls in some builds**, decided purely by memory layout.
+  `dc/Makefile` ships a labelled workaround so the default build plays.
+
+[`kb/STATE.md`](kb/STATE.md) is the honest list and is updated in the same
+commit as the change it describes. This section is a summary of it, not a
+roadmap.
 
 ## Quick start
 
@@ -43,6 +52,7 @@ TR_DATA=./data bash dc/build-dc.sh   # -> dc/build/TuxRacer.cdi
 
 harness/dc/install-flycast.sh        # once
 harness/dc/smoke.sh                  # boot it, assert on what the guest prints
+harness/dc/playtest.sh               # the real gate: does it reach a race?
 ```
 
 The host needs nothing but Docker. The whole toolchain — `sh-elf-gcc` 15.2.0,
@@ -50,15 +60,34 @@ KallistiOS, GLdc, Jim Tcl, libmodplug, `mkdcdisc` — lives inside the
 `tuxracer-dc:sdk` image, so there is nothing to install and nothing to break on
 a macOS upgrade.
 
+Tagged builds are produced by CI: push `v*` and
+[`.github/workflows/release-cdi.yml`](.github/workflows/release-cdi.yml)
+builds the image, fetches and verifies the data, and attaches
+`TuxRacer.cdi` to the GitHub release. Nothing is built on ordinary pushes.
+
+## The development loop
+
+```bash
+DC_TARGET=objs bash dc/build-dc.sh          # does it compile?   <- fast gate
+bash dc/build-dc.sh                         # does it link + package?
+harness/dc/smoke.sh                         # does it boot and say so?
+harness/dc/crash.sh dc/build/TuxRacer.cdi   # if it didn't, why not
+```
+
+`make objs` is the cheap signal: ~79 translation units, no link. Runtime
+behaviour is not worth looking at before that is green.
+[`CLAUDE.md`](CLAUDE.md) is the working agreement — hard rules, the `kb/`
+convention, and the platform budget.
+
 ## Layout
 
 | Path | What it is |
 |---|---|
 | `src/` | **Upstream 0.61, verbatim.** Committed unmodified first, so every later commit reads as a port diff. Do not edit it; add to `dc/` instead. |
-| `dc/include/` | Shim headers, placed first on the include path: `config.h` (replaces autoconf), `tcl.h` (→ Jim), `SDL_mixer.h` (→ KOS audio), `tr_glcompat.h`. |
+| `dc/include/` | Shim headers, placed first on the include path: `config.h` (replaces autoconf), `tcl.h` (→ Jim), `SDL_mixer.h` (→ the mixer), `dc_aica.h`, `tr_glcompat.h`. |
 | `dc/src/` | Dreamcast-only C: windowing, input, audio, GL gap-filling, harness. |
 | `dc/Makefile` | The build. Plain GNU make, not CMake, not autoconf. |
-| `harness/dc/` | Flycast test harness — boot an image, read the guest's serial output, turn markers into an exit code. |
+| `harness/dc/` | Flycast test harness — boot an image, read the guest's serial output, turn markers into an exit code. Plus `audiotest/`, the standalone AICA probe. |
 | `kb/` | Design notes. Evidence, not tutorials: every claim cites the command or `file:line` behind it. |
 | `tools/` | `fetch-data.sh` and friends. |
 
@@ -77,6 +106,18 @@ of mystery bugs in course loading. Jim is a real Tcl in about a tenth of the
 size, it is already a kos-port, and the game only touches ~35 `Tcl_*` entry
 points, which is a small adapter. See [`kb/design-tcl.md`](kb/design-tcl.md).
 
+**The AICA is driven from the SH-4, not through KOS's ARM firmware.** KOS plays
+sound by uploading an ARM7 program into sound RAM and posting commands to it.
+That firmware enables its timer FIQ with `msr CPSR_c`, which Flycast's ARM7
+ignores, so the FIQ never arrives, the firmware hangs on its first
+`timer_wait()`, and *every* queued command — music and effects alike — goes to
+a processor that will never read it. The ARM is only a proxy, so
+[`dc/src/dc_aica.c`](dc/src/dc_aica.c) writes the channel registers over G2
+directly, and the music stream is two voices looping over a ring in sound RAM
+that a thread refills ahead of the play position. The whole investigation, with
+the probe that isolated it, is in
+[`kb/design-audio.md`](kb/design-audio.md).
+
 **The harness is not optional.** Flycast has no GDB stub, no headless mode and
 never exits on its own, so "run it and look" does not scale and cannot gate a
 commit. Instead the guest prints typed one-line records over the emulated SCIF
@@ -90,4 +131,4 @@ and rebranded; the operating manual is
 
 Tux Racer is GPL-2.0 (see [`LICENSE`](LICENSE)); everything added here is under
 the same terms. The game data package is fetched from upstream at build time
-and is not redistributed in this repository.
+and is not committed to this repository.
