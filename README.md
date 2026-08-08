@@ -54,7 +54,9 @@ TR_DATA=./data bash dc/build-dc.sh   # -> dc/build/TuxRacer.cdi
 
 harness/dc/install-flycast.sh        # once
 harness/dc/smoke.sh                  # boot it, assert on what the guest prints
-harness/dc/playtest.sh               # the real gate: does it reach a race?
+harness/dc/playtest.sh               # does it reach a race?
+harness/dc/release-gate.sh           # run before every tag: boots the exact
+                                     # bytes CI ships, with no extra defines
 ```
 
 The host needs nothing but Docker. The whole toolchain — `sh-elf-gcc` 15.2.0,
