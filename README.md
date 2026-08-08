@@ -100,10 +100,27 @@ are worth an issue — the harness cannot see them.
 B is deliberately *not* brake: it maps to Escape, which is the in-race quit
 key, so braking with it would abort the run.
 
-Tagged builds are produced by CI: push `v*` and
-[`.github/workflows/release-cdi.yml`](.github/workflows/release-cdi.yml)
-builds the toolchain image, fetches and sha256-verifies the data, and attaches
-the results to the GitHub release. Nothing is built on ordinary pushes.
+### Cutting a release
+
+Release assets are built **locally and booted before they are uploaded**:
+
+```bash
+bash tools/fetch-data.sh && bash tools/stage-data.sh   # -> ./data-dc
+harness/dc/release-gate.sh                             # builds + boots the
+                                                       # exact shipping bytes
+gh release create vX.Y.Z --notes-file notes.md \
+    dc/build/TuxRacer.cdi dc/build/tuxracer.elf
+```
+
+CI ([`.github/workflows/release-cdi.yml`](.github/workflows/release-cdi.yml))
+still builds the whole thing from nothing on every `v*` tag, and that is worth
+having — it proves the tree builds on a clean machine — but it uploads a
+workflow artifact and **does not attach anything to a release**. A runner has
+no way to boot a Dreamcast image (Flycast has no headless mode), and with a
+layout-sensitive bug in the tree an unbooted binary is a coin flip: CI's
+toolchain image and the maintainer's differ by four bytes of `.text`, and that
+alone was the difference between a build that races and the black screen that
+shipped as v0.1.0 and v0.1.1.
 
 ## The development loop
 

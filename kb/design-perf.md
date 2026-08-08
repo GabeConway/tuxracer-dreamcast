@@ -163,3 +163,30 @@ v0.1.0 was tagged after `playtest.sh` passed, and `playtest.sh` builds with
 happened to land on the working side. The release CDI had none of them and hung
 at a black screen. **The gate has to be a build with no extra defines** — that
 is now written into `kb/STATE.md`.
+
+## The margin is four bytes (2026-08-08)
+
+v0.1.1 shipped with `TR_FBDUMP_FRAME=0`, which the maintainer's build had been
+gated on (`harness/dc/release-gate.sh`: boots, 68 PERF records). The CI image
+built from the same commit hung before its first frame.
+
+MEASURED, `sh-elf-size` on the two ELFs:
+
+| build | text | data | bss |
+|---|---:|---:|---:|
+| local (`tuxracer-dc:sdk` via `Dockerfile.overlay`) | 1,008,901 | 17,396 | 2,315,516 |
+| CI (`tuxracer-dc:sdk` via the standalone `Dockerfile`) | 1,008,905 | 17,396 | 2,315,516 |
+
+Four bytes of `.text`. Same source, same flags, same KOS/GLdc pins; the two
+images are built by different recipes and something in one of them lands four
+bytes differently. That is the entire margin between a build that races and a
+build that shows a black screen.
+
+Ruled out along the way: the disc data. A local build with the raw upstream
+`./data` (what CI shipped) boots exactly like the staged `./data-dc` one, so
+staging was a real bug in the workflow but not this bug.
+
+Consequence for releases: nothing that has not been booted may be published.
+Release assets are now cut locally behind `release-gate.sh`, and CI produces an
+artifact only — a runner cannot boot a Dreamcast image, so it cannot tell the
+two builds above apart.

@@ -3,8 +3,25 @@
 # Nothing here runs on an ordinary push or pull request: a CDI build means
 # building the whole sh-elf toolchain image and fetching the 12 MB data package,
 # which is minutes of runner time that a source-only change does not need. Tag
-# `v*` (or run the workflow by hand) and this produces `TuxRacer.cdi`, attaches
-# it to the release for that tag, and keeps a copy as a workflow artifact.
+# `v*` (or run the workflow by hand) and this produces `TuxRacer.cdi` as a
+# workflow artifact.
+#
+# IT DOES NOT ATTACH ANYTHING TO A RELEASE, and that is deliberate.
+#
+# A runner cannot boot a Dreamcast image: Flycast has no headless mode
+# (SDL_VIDEODRIVER=dummy and =offscreen both abort), so nothing here can tell
+# a working build from a black screen. That would be a tolerable risk in most
+# projects. It is not tolerable in this one, because the port has a latent
+# memory bug whose symptom is decided purely by heap layout (kb/design-perf.md),
+# and the margin is tiny: CI's toolchain image and the maintainer's differ by
+# FOUR BYTES of .text, and that was enough for the CI build to hang before its
+# first frame while the local build of the same commit raced fine. v0.1.0 and
+# v0.1.1 both shipped that way.
+#
+# So release assets are cut locally, after harness/dc/release-gate.sh has
+# actually booted them (see README, "Cutting a release"). This workflow exists
+# to prove the tree still builds from nothing on a clean machine, which is
+# worth having on its own.
 #
 # ARM64 runners on purpose. Every docker invocation in this repo passes
 # `--platform linux/arm64` -- that is deliberate on the maintainer's Apple
@@ -87,11 +104,22 @@ jobs:
       - name: Fetch and verify game data
         run: bash tools/fetch-data.sh
 
+      # The disc gets ./data-dc, NOT ./data. Staging rewrites the seven sound
+      # effects to mono 22050 Hz and trims the three looping terrain sounds
+      # under the AICA's 65534-sample ceiling -- without it the whole effect
+      # set costs 1.6 MB of a 2 MB sound-RAM pool and three of them are cut at
+      # an arbitrary point. v0.1.1 shipped the unstaged data by mistake.
+      # ffmpeg is preinstalled on GitHub's ubuntu runners.
+      - name: Stage disc data
+        run: |
+          ffmpeg -version | head -1
+          bash tools/stage-data.sh
+
       - name: Compile check
         run: DC_TARGET=objs bash dc/build-dc.sh
 
       - name: Build CDI
-        run: TR_DATA=./data bash dc/build-dc.sh
+        run: TR_DATA=./data-dc bash dc/build-dc.sh
 
       # Written to the workspace root, NOT into dc/build: the build runs in a
       # container as root, so dc/build is root-owned and the runner user
@@ -112,17 +140,3 @@ jobs:
             dc/build/tuxracer.elf
             SHA256SUMS
           if-no-files-found: error
-
-      # A tag push attaches to that tag's release, creating it if the tag was
-      # pushed without one. A manual run only attaches when given a tag.
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.tag != '' && inputs.tag || github.ref_name }}
-        run: |
-          gh release view "$TAG" >/dev/null 2>&1 || \
-            gh release create "$TAG" --title "$TAG" --generate-notes
-          gh release upload "$TAG" \
-            dc/build/TuxRacer.cdi dc/build/tuxracer.elf SHA256SUMS \
-            --clobber
