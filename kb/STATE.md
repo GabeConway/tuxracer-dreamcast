@@ -24,14 +24,20 @@ roadmap. If something is not listed as verified here, assume it is not.
 
 ## Known broken
 
-- **Course loading stalls, and it is decided purely by memory layout.**
-  Four builds of identical source: plain stalls; with the framebuffer-dump
-  code present it races (even with the dump set to a frame number that never
-  arrives); adding `TR_AUTOEXIT` instead makes it stall again. That is a
-  latent memory bug, not a rendering one. `dc/Makefile` currently ships a
-  labelled workaround (`TR_FBDUMP_FRAME ?= 999999`) so the default build
-  plays. **Top open issue** — full evidence and the next step in
-  `kb/design-perf.md`.
+- **A latent memory bug whose symptom is decided purely by memory layout, and
+  it has already flipped polarity once.** Before the audio rewrite, a build
+  without the framebuffer-dump code stalled after race-select; with it (set to
+  a frame that never arrives, so it never fires) the same source raced. After
+  the audio rewrite the reverse is true: with the dump code the game hangs
+  before its first frame — that is what shipped as the broken v0.1.0 release —
+  and with `TR_FBDUMP_FRAME=0` it boots, races and exits clean. The default in
+  `dc/Makefile` is now 0. **Top open issue**; nothing about it is fixed, only
+  re-masked. Full evidence in `kb/design-perf.md`.
+- **The shipping configuration is the one that must be tested.** v0.1.0 was
+  tagged on the strength of harness builds (`-DTR_AUTOKEY`, `-DTR_AUDIO_TRACE`),
+  and every one of those extra defines moves the heap. The release CDI, built
+  with none of them, hung at a black screen. Gate a release on a build with no
+  extra defines.
 - **Racing runs at 9–11 fps** with music playing (was 12–15 before audio
   worked; libmodplug decodes 22050 Hz stereo on the SH-4 alongside the game).
   Menus are vsync-locked at 59. Levers are ranked in `kb/design-perf.md`; none

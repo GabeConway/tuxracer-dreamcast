@@ -100,26 +100,35 @@ else
   HARNESS_DEFS :=
 endif
 
-# ⚠️ WORKAROUND, NOT A FEATURE. Read kb/design-perf.md "Open problem" before
-# touching this line.
+# ⚠️ WORKAROUND, NOT A FEATURE, AND IT HAS FLIPPED ONCE ALREADY. Read
+# kb/design-perf.md "Open problem" before touching this line.
 #
-# Without -DTR_FBDUMP_FRAME the build stalls after race-select and never
-# reaches the racing view: the guest goes silent, no crash dump, no assert,
-# reproduced at 200 s, 320 s and 600 s deadlines. WITH it the same source
-# loads the course in ~40 s and races for 54 s straight, repeatedly.
+# There is a latent memory bug in this port whose symptom is decided purely by
+# memory layout: a build either completes what it is doing or goes silent --
+# no crash dump, no assert, no deadline that saves it.
 #
-# The value below is deliberately larger than any reachable frame number, so
-# the dump NEVER FIRES. MEASURED: it races anyway. That rules out the ~5 s
-# pause the dump costs and leaves only what its presence changes -- ~1.5 KB of
-# statics kept alive plus a few instructions in winsys_swap_buffers. A build
-# difference that changes only memory layout deciding whether a load completes
-# is a latent memory bug, and this line is masking it, not fixing it.
+# History, both halves MEASURED:
 #
-# It is here because a game that plays beats a game that stalls while the real
-# bug is hunted. Set TR_FBDUMP_FRAME to a real frame number to capture a
-# screenshot (tools/fbdump.sh does), or to 0 to remove the workaround and
-# reproduce the stall.
-TR_FBDUMP_FRAME ?= 999999
+#   Before the audio rewrite: without -DTR_FBDUMP_FRAME the build stalled
+#   after race-select and never reached the racing view. With it (set to a
+#   frame number that never arrives, so the dump NEVER FIRES) the same source
+#   loaded the course in ~40 s and raced for 54 s straight, repeatedly. The
+#   default was 999999 for that reason.
+#
+#   After the audio rewrite (dc/src/dc_aica.c, which changed what the heap
+#   looks like): the polarity reversed. With the dump code present the game
+#   hangs before its FIRST FRAME -- that shipped as the broken v0.1.0 release
+#   -- and with TR_FBDUMP_FRAME=0 it boots, races and exits clean
+#   (harness/dc/playtest.sh, all checks green).
+#
+# So the default is now 0. That is not a fix and it is not stable ground: the
+# next change that moves the heap can flip it back. The real bug is still
+# unfound, and the tell is always the same -- a build difference that changes
+# only memory layout deciding whether the game runs.
+#
+# Set TR_FBDUMP_FRAME to a real frame number to capture a screenshot
+# (tools/fbdump.sh does).
+TR_FBDUMP_FRAME ?= 0
 ifneq ($(TR_FBDUMP_FRAME),0)
   HARNESS_DEFS += -DTR_FBDUMP_FRAME=$(TR_FBDUMP_FRAME) -DTR_FBDUMP_FULL=1
 endif

@@ -20,6 +20,21 @@
 #define SNDREG(x)       (0xa0700000 + (x))
 #define CHNREG(ch, x)   SNDREG(0x80 * (ch) + (x))
 
+/* EVERY G2 access below is inside a g2_lock() block, and that is not
+ * belt-and-braces: g2_read_*()/g2_write_*() are only atomic between g2_lock()
+ * and g2_unlock(), which disable IRQs and suspend G2 DMA (dc/g2bus.h:148).
+ * The G2 bus cannot do PIO and DMA at once, so an interrupt or a GD-ROM/AICA
+ * DMA landing in the middle of one of these register writes wedges the bus.
+ *
+ * MEASURED: without the locks the game hung before its first frame as soon as
+ * a second thread existed -- the music thread was enough, even doing nothing
+ * but sleeping -- because preemption put an IRQ inside a G2 transaction. The
+ * KOS calls this file replaces (snd_sh4_to_aica etc.) all lock; skipping it
+ * was the bug, and it was invisible while the game was single-threaded.
+ *
+ * Blocks are kept short for the same reason -- IRQs are off inside them, so
+ * the 64-voice sweeps lock per voice rather than once around the loop. */
+
 static int aica_up = 0;
 
 /* Linear 0..255 -> the AICA's 0..255 logarithmic attenuation, where 0 is
@@ -98,7 +113,11 @@ void dc_aica_init(void) {
 
     /* Master volume and mixer routing, as arm/aica.c:aica_init() sets them.
      * Without this every voice plays into a muted mixer. */
-    g2_write_32(SNDREG(0x2800), 0x000f);
+    {
+        g2_ctx_t ctx = g2_lock();
+        g2_write_32(SNDREG(0x2800), 0x000f);
+        g2_unlock(ctx);
+    }
 
     for(ch = 0; ch < DC_AICA_VOICES; ch++)
         dc_aica_stop(ch);
@@ -108,11 +127,15 @@ void dc_aica_init(void) {
 
 static void program(int ch, uint32_t aram, int fmt, uint32_t nsamp,
                     int loop, uint32_t freq, int vol, int pan) {
+    g2_ctx_t ctx;
+
     if(ch < 0 || ch >= DC_AICA_VOICES)
         return;
 
     if(nsamp > DC_AICA_MAX_SAMPLES)
         nsamp = DC_AICA_MAX_SAMPLES;
+
+    ctx = g2_lock();
 
     /* Key off first: the loop registers of a sounding voice must not change
      * underneath it. */
@@ -132,6 +155,8 @@ static void program(int ch, uint32_t aram, int fmt, uint32_t nsamp,
     g2_write_32(CHNREG(ch, 0),
                 (((uint32_t)fmt) << 7) | ((aram >> 16) & 0x7f) |
                 (loop ? 0x0200 : 0));
+
+    g2_unlock(ctx);
 }
 
 void dc_aica_play_delayed(int ch, uint32_t aram, int fmt, uint32_t nsamp,
@@ -143,8 +168,11 @@ void dc_aica_key_on(uint64_t chmask) {
     int ch;
 
     for(ch = 0; ch < DC_AICA_VOICES; ch++) {
-        if(chmask & (1ULL << ch))
+        if(chmask & (1ULL << ch)) {
+            g2_ctx_t ctx = g2_lock();
             g2_write_32(CHNREG(ch, 0), g2_read_32(CHNREG(ch, 0)) | 0xc000);
+            g2_unlock(ctx);
+        }
     }
 }
 
@@ -155,12 +183,16 @@ void dc_aica_play(int ch, uint32_t aram, int fmt, uint32_t nsamp,
 }
 
 void dc_aica_stop(int ch) {
+    g2_ctx_t ctx;
+
     if(ch < 0 || ch >= DC_AICA_VOICES)
         return;
 
     /* KEYONEX without KEYONB: the AICA reads the key state on the KEYONEX
      * edge, so this is what actually releases the voice. */
+    ctx = g2_lock();
     g2_write_32(CHNREG(ch, 0), (g2_read_32(CHNREG(ch, 0)) & ~0x4000) | 0x8000);
+    g2_unlock(ctx);
 }
 
 void dc_aica_stop_all(void) {
@@ -171,18 +203,30 @@ void dc_aica_stop_all(void) {
 }
 
 void dc_aica_set_vol(int ch, int vol) {
+    g2_ctx_t ctx;
+
     if(ch < 0 || ch >= DC_AICA_VOICES)
         return;
+
+    ctx = g2_lock();
     g2_write_8(CHNREG(ch, 41), calc_vol(vol));
+    g2_unlock(ctx);
 }
 
 void dc_aica_set_pan(int ch, int pan) {
+    g2_ctx_t ctx;
+
     if(ch < 0 || ch >= DC_AICA_VOICES)
         return;
+
+    ctx = g2_lock();
     g2_write_8(CHNREG(ch, 36), calc_pan(pan));
+    g2_unlock(ctx);
 }
 
 uint32_t dc_aica_pos(int ch) {
+    g2_ctx_t ctx;
+    uint32_t pos;
     int i;
 
     if(ch < 0 || ch >= DC_AICA_VOICES)
@@ -192,10 +236,14 @@ uint32_t dc_aica_pos(int ch) {
      * the low byte of 0x280c, give the AICA a moment, then read 0x2814. The
      * delay is arm/aica.c:aica_get_pos()'s, kept because the register is not
      * latched instantly. */
+    ctx = g2_lock();
     g2_write_8(SNDREG(0x280d), (uint8_t)ch);
 
     for(i = 0; i < 20; i++)
         __asm__ volatile ("nop");
 
-    return g2_read_32(SNDREG(0x2814)) & 0xffff;
+    pos = g2_read_32(SNDREG(0x2814)) & 0xffff;
+    g2_unlock(ctx);
+
+    return pos;
 }

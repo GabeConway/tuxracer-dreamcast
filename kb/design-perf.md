@@ -124,3 +124,42 @@ fine. Fix the memory bug and the gate starts working; do not "fix" the gate.
 - Whether the SH-4's `-mfsrra`/`-mfsca` math paths are being used by the
   physics loops at all.
 - Real hardware, at all.
+
+---
+
+# The layout bug flipped polarity (2026-08-07)
+
+The workaround at the top of `dc/Makefile` was `TR_FBDUMP_FRAME ?= 999999`,
+because without the framebuffer-dump code present the build stalled after
+race-select. After the audio rewrite (`dc/src/dc_aica.c`, `dc/src/dc_mixer.c`,
+which changed the shape of the heap) the same knob does the opposite.
+
+MEASURED, all with `TR_DATA=./data-dc bash dc/build-dc.sh` and no other
+defines:
+
+| Build | Result |
+|---|---|
+| pre-audio commit `3f095b7`, default (`999999`) | boots, splash at 59 fps |
+| post-audio, default (`999999`) | **hangs before `MARK:FIRST_FRAME`**, last line is `dc_mixer: open` |
+| post-audio, music thread not created | boots, 59 fps |
+| post-audio, music thread created but only `thd_sleep()` | hangs |
+| post-audio, `TR_FBDUMP_FRAME=0` | boots, and `playtest.sh` reaches `MARK:RACING` and exits clean |
+
+Two things worth keeping from that table. First, a thread that does nothing but
+sleep is enough to trigger it, so it is not about what the music thread *does*;
+it is preemption plus where things sit in memory. Second, the G2 bus locking
+that `dc_aica.c` was missing (`g2_lock()` around every register access, which
+KOS requires and which this port had skipped) is a real bug that was fixed on
+the way past — but fixing it did **not** change this table. It was necessary
+and not sufficient.
+
+The default is now 0. That is a coin landing the other way up, not a fix.
+
+## What made this ship broken
+
+v0.1.0 was tagged after `playtest.sh` passed, and `playtest.sh` builds with
+`-DTR_AUTOKEY` and `-DTR_AUTOEXIT`; the audio work before it was verified with
+`-DTR_AUDIO_TRACE`. Every one of those defines moves the heap, and all of them
+happened to land on the working side. The release CDI had none of them and hung
+at a black screen. **The gate has to be a build with no extra defines** — that
+is now written into `kb/STATE.md`.

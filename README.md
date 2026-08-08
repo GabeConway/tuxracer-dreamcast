@@ -36,8 +36,10 @@ What is still wrong, in the order it is felt:
   by some textures and not others. Not diagnosed.
 - **Settings do not persist** — KOS's ramdisk has no `mkdir` and the VMU
   filesystem is flat, so `~/.tuxracer/options` cannot exist.
-- **Course loading stalls in some builds**, decided purely by memory layout.
-  `dc/Makefile` ships a labelled workaround so the default build plays.
+- **A latent memory bug decided purely by memory layout.** Which builds hang
+  and which run is set by nothing but where things land in the heap, and it has
+  flipped polarity once already (it is what made the first v0.1.0 release a
+  black screen). `dc/Makefile` carries a labelled knob, not a fix.
 
 [`kb/STATE.md`](kb/STATE.md) is the honest list and is updated in the same
 commit as the change it describes. This section is a summary of it, not a
